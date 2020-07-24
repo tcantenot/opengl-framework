@@ -2017,16 +2017,9 @@ void renderGui(double cpuDt, double gpuDt)
         ImGui::End();
         // Terrain Widgets
         ImGui::SetNextWindowPos(ImVec2(10, 140)/*, ImGuiSetCond_FirstUseEver*/);
-        ImGui::SetNextWindowSize(ImVec2(510, 300)/*, ImGuiSetCond_FirstUseEver*/);
+        ImGui::SetNextWindowSize(ImVec2(510, 380)/*, ImGuiSetCond_FirstUseEver*/);
         ImGui::Begin("Terrain");
         {
-			ImGui::SliderFloat("Position X", &g_terrain.pos.x, -20.f, +20.f);
-			ImGui::SliderFloat("Position Y", &g_terrain.pos.y, -20.f, +20.f);
-			ImGui::SliderFloat("Position Z", &g_terrain.pos.z, -20.f, +20.f);
-			ImGui::SliderFloat("Rotation X", &g_terrain.rotAnglesInDegrees.x, -180.f, +180.f);
-			ImGui::SliderFloat("Rotation Y", &g_terrain.rotAnglesInDegrees.y, -180.f, +180.f);
-			ImGui::SliderFloat("Rotation Z", &g_terrain.rotAnglesInDegrees.z, -180.f, +180.f);
-
             const char* eShadings[] = {
                 "Diffuse",
                 "Normals",
@@ -2075,7 +2068,7 @@ void renderGui(double cpuDt, double gpuDt)
                 if(ImGui::Checkbox("displace", &g_terrain.flags.displace))
                     loadTerrainProgram();
             }
-            if(ImGui::SliderInt("baseSubdivisionLevel", &g_terrain.baseSubdivisionLevel, 0, 3)) {
+            if(ImGui::SliderInt("Base subdivision level", &g_terrain.baseSubdivisionLevel, 0, 5)) {
                 loadInstancedGeometryBuffers();
                 loadInstancedGeometryVertexArray();
                 loadPrograms();
@@ -2108,6 +2101,16 @@ void renderGui(double cpuDt, double gpuDt)
                     g_terrain.flags.reset = true;
                 }
             }
+
+			if(ImGui::CollapsingHeader("Transform"))
+			{
+				ImGui::SliderFloat("Position X", &g_terrain.pos.x, -20.f, +20.f);
+				ImGui::SliderFloat("Position Y", &g_terrain.pos.y, -20.f, +20.f);
+				ImGui::SliderFloat("Position Z", &g_terrain.pos.z, -20.f, +20.f);
+				ImGui::SliderFloat("Rotation X", &g_terrain.rotAnglesInDegrees.x, -180.f, +180.f);
+				ImGui::SliderFloat("Rotation Y", &g_terrain.rotAnglesInDegrees.y, -180.f, +180.f);
+				ImGui::SliderFloat("Rotation Z", &g_terrain.rotAnglesInDegrees.z, -180.f, +180.f);
+			}
         }
         ImGui::End();
 
