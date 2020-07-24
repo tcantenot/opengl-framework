@@ -51,6 +51,90 @@
 // TODO:
 //  - try 16-bit UV (i_TessCoord)
 
+////////////////////////////////////////////////////////////////////////////////
+// Compatibility layer
+////////////////////////////////////////////////////////////////////////////////
+
+using Vec2   = dja::vec2;
+using Vec3   = dja::vec3;
+using Vec4   = dja::vec4;
+using Mat3x3 = dja::mat3;
+using Mat4x4 = dja::mat4;
+
+inline Vec3 Normalize(const Vec3& v)
+{
+	return dja::normalize(v);
+}
+
+inline float Length(const Vec3& v)
+{
+	return dja::norm(v);
+}
+
+inline Mat3x3 Mat3x3Identity()
+{
+	return Mat3x3(1.f);
+}
+
+inline Mat4x4 Mat3x3ToMat4x4(const Mat3x3& m)
+{
+    return dja::mat4::homogeneous::from_mat3(m);
+}
+
+inline Mat3x3 Mul(const Mat3x3 & m0, const Mat3x3 & m1)
+{
+	return m1 * m0;
+}
+
+inline Mat4x4 Mul(const Mat4x4 & m0, const Mat4x4 & m1)
+{
+	return m1 * m0;
+}
+
+inline Vec3 Transform(const Mat3x3 & m, const Vec3 & v)
+{
+	return m * v;
+}
+
+inline Mat3x3 Transpose(const Mat3x3 & m)
+{
+	return dja::transpose(m);
+}
+
+inline Mat4x4 Transpose(const Mat4x4 & m)
+{
+	return dja::transpose(m);
+}
+
+inline Mat4x4 Inverse(const Mat4x4 & m)
+{
+	return dja::inverse(m);
+}
+
+inline Mat3x3 Mat3x3Rotation(const Vec3 & axis, float angleRadian)
+{
+	return dja::mat3::rotation(axis, angleRadian);
+}
+
+inline Mat4x4 Mat4x4Rotation(const Vec3 & axis, float angleRadian)
+{
+	return dja::mat4::homogeneous::rotation(axis, angleRadian);
+}
+
+inline Mat4x4 Mat4x4Translation(const Vec3 & position)
+{
+	return dja::mat4::homogeneous::translation(position);
+}
+
+inline Mat4x4 Mat4x4Perspective(float fovy, float aspect, float zNear, float zFar)
+{
+	return dja::mat4::homogeneous::perspective(fovy, aspect, zNear, zFar);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Debug
+////////////////////////////////////////////////////////////////////////////////
+
 void SetGLObjectLabel(GLenum identifier, GLuint name, const char * label)
 {
 	glObjectLabel(identifier, name, -1, label);
@@ -77,18 +161,18 @@ struct FramebufferManager {
 
 // -----------------------------------------------------------------------------
 // Camera Manager
-#define INIT_POS dja::vec3(0.5f, 0.0f, 0.5f)
+#define INIT_POS Vec3(0.5f, 0.0f, 0.5f)
 struct CameraManager {
     float fovy, zNear, zFar; // perspective settings
-    dja::vec3 pos;           // 3D position
-    dja::mat3 axis;          // 3D frame
+    Vec3 pos;           // 3D position
+    Mat3x3 axis;          // 3D frame
 } g_camera = {
     55.f, 0.0001f, 32.f,
     INIT_POS,
-    dja::mat3::lookat(
-        dja::vec3(0.f, 0.f, 0.2f),
+    Mat3x3::lookat(
+        Vec3(0.f, 0.f, 0.2f),
         INIT_POS,
-        dja::vec3(0, 0, 1)
+        Vec3(0, 0, 1)
     )
 };
 #undef INIT_POS
@@ -98,8 +182,8 @@ struct CameraManager {
 enum { METHOD_TS, METHOD_GS, METHOD_CS, METHOD_MS };
 enum { SHADING_DIFFUSE, SHADING_NORMALS, SHADING_LOD };
 struct TerrainManager {
-	dja::vec3 pos;
-	dja::vec3 rotAnglesInDegrees;
+	Vec3 pos;
+	Vec3 rotAnglesInDegrees;
     struct { bool displace, cull, freeze, wire, reset, freeze_step; } flags;
     struct {
         std::string pathToFile;
@@ -243,16 +327,16 @@ int instancedMeshPrimitiveCount = 0;
 
 
 //Early declarations of ad-hoc instanced geom vertex/index buffers
-extern const dja::vec2 verticesL0[3];
+extern const Vec2 verticesL0[3];
 extern const uint16_t indexesL0[3];
 
-extern const dja::vec2 verticesL1[6];
+extern const Vec2 verticesL1[6];
 extern const uint16_t indexesL1[12];
 
-extern const dja::vec2 verticesL2[15];
+extern const Vec2 verticesL2[15];
 extern const uint16_t indexesL2[48];
 
-extern const dja::vec2 verticesL3[45];
+extern const Vec2 verticesL3[45];
 extern const uint16_t indexesL3[192];
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -882,7 +966,7 @@ bool loadTransformBuffer()
 {
     static bool first = true;
     struct Transform {
-        dja::mat4 localToWorld, worldToView, viewToLocal, modelView, projection, modelViewProjection, _pad0, _pad1;
+        Mat4x4 localToWorld, worldToView, viewToLocal, modelView, projection, modelViewProjection, _pad0, _pad1;
     } transform;
 
     if(first) {
@@ -891,37 +975,36 @@ bool loadTransformBuffer()
     }
 
     // extract view and projection matrices
-    dja::mat4 projection = dja::mat4::homogeneous::perspective(
+    Mat4x4 projection = Mat4x4Perspective(
         radians(g_camera.fovy),
         (float)g_framebuffer.w / (float)g_framebuffer.h,
         g_camera.zNear,
         g_camera.zFar
     );
-    dja::mat4 viewInv = dja::mat4::homogeneous::translation(g_camera.pos)
-        * dja::mat4::homogeneous::from_mat3(g_camera.axis);
-    dja::mat4 worldToView = dja::inverse(viewInv);
+    Mat4x4 viewInv = Mul(Mat3x3ToMat4x4(g_camera.axis), Mat4x4Translation(g_camera.pos));
+    Mat4x4 worldToView = Inverse(viewInv);
 
-	dja::mat4 rotX = dja::mat4::homogeneous::rotation(dja::vec3(1, 0, 0), g_terrain.rotAnglesInDegrees.x * M_PI / 180.f);
-	dja::mat4 rotY = dja::mat4::homogeneous::rotation(dja::vec3(0, 1, 0), g_terrain.rotAnglesInDegrees.y * M_PI / 180.f);
-	dja::mat4 rotZ = dja::mat4::homogeneous::rotation(dja::vec3(0, 0, 1), g_terrain.rotAnglesInDegrees.z * M_PI / 180.f);
-	dja::mat4 translation = dja::mat4::homogeneous::translation(g_terrain.pos);
-	dja::mat4 localToWorld = translation * rotX * rotY * rotZ;
+	Mat4x4 rotX = Mat4x4Rotation(Vec3(1, 0, 0), g_terrain.rotAnglesInDegrees.x * M_PI / 180.f);
+	Mat4x4 rotY = Mat4x4Rotation(Vec3(0, 1, 0), g_terrain.rotAnglesInDegrees.y * M_PI / 180.f);
+	Mat4x4 rotZ = Mat4x4Rotation(Vec3(0, 0, 1), g_terrain.rotAnglesInDegrees.z * M_PI / 180.f);
+	Mat4x4 translation = Mat4x4Translation(g_terrain.pos);
+	Mat4x4 localToWorld = Mul(Mul(Mul(rotZ, rotY), rotX), translation);
 
     // set transformations
 	transform.localToWorld = localToWorld;
 	transform.worldToView = worldToView;
     transform.projection = projection;
-    transform.modelView = worldToView * localToWorld;
-    transform.modelViewProjection = transform.projection * transform.modelView;
-    transform.viewToLocal = dja::inverse(worldToView * localToWorld);
+    transform.modelView = Mul(localToWorld, worldToView);
+    transform.modelViewProjection = Mul(transform.modelView, transform.projection);
+    transform.viewToLocal = Inverse(Mul(localToWorld, worldToView));
 
 	// transpose manually for AMD
-	transform.localToWorld = dja::transpose(transform.localToWorld);
-	transform.worldToView = dja::transpose(transform.worldToView);
-	transform.projection = dja::transpose(transform.projection);
-	transform.modelView = dja::transpose(transform.modelView);
-	transform.modelViewProjection = dja::transpose(transform.modelViewProjection);
-	transform.viewToLocal = dja::transpose(transform.viewToLocal);
+	transform.localToWorld = Transpose(transform.localToWorld);
+	transform.worldToView = Transpose(transform.worldToView);
+	transform.projection = Transpose(transform.projection);
+	transform.modelView = Transpose(transform.modelView);
+	transform.modelViewProjection = Transpose(transform.modelViewProjection);
+	transform.viewToLocal = Transpose(transform.viewToLocal);
 
     // upload to GPU
     djgb_to_gl(g_gl.streams[STREAM_TRANSFORM], (const void *)&transform, NULL);
@@ -941,7 +1024,7 @@ bool loadTransformBuffer()
 bool loadGeometryBuffers()
 {
     LOG("Loading {Mesh-Vertex-Buffer}\n");
-    const dja::vec4 vertices[] = {
+    const Vec4 vertices[] = {
         {-1.0f, -1.0f, 0.0f, 1.0f},
         {+1.0f, -1.0f, 0.0f, 1.0f},
         {+1.0f, +1.0f, 0.0f, 1.0f},
@@ -985,22 +1068,25 @@ bool loadGeometryBuffers()
  * for the compute-shader based pipline.
  */
 
-dja::mat3 bitToXform(uint32_t bit)
+
+
+Mat3x3 bitToXform(uint32_t bit)
 {
     float s = float(bit) - 0.5f;
-    dja::vec3 c1 = dja::vec3(s, -0.5, 0);
-    dja::vec3 c2 = dja::vec3(-0.5, -s, 0);
-    dja::vec3 c3 = dja::vec3(+0.5, +0.5, 1);
+    Vec3 c1 = Vec3(s, -0.5, 0);
+    Vec3 c2 = Vec3(-0.5, -s, 0);
+    Vec3 c3 = Vec3(+0.5, +0.5, 1);
 
-    return dja::transpose(dja::mat3(c1, c2, c3));
+    return Transpose(Mat3x3(c1, c2, c3));
 }
 
-dja::mat3 keyToXform(uint32_t key)
+Mat3x3 keyToXform(uint32_t key)
 {
-    dja::mat3 xf = dja::mat3(1.f);
+    Mat3x3 xf = Mat3x3Identity();
 
-    while (key > 1u) {
-        xf = bitToXform(key & 1u) * xf;
+    while(key > 1u)
+	{
+        xf  = Mul(xf, bitToXform(key & 1u));
         key = key >> 1u;
     }
 
@@ -1010,7 +1096,7 @@ dja::mat3 keyToXform(uint32_t key)
 bool loadInstancedGeometryBuffers()
 {
     bool buffAllocated = false;
-    dja::vec2 *vertices; // vec2 for uv (barycentric) coordinates (used to interpolate vertex positions, ...)
+    Vec2 *vertices; // vec2 for uv (barycentric) coordinates (used to interpolate vertex positions, ...)
     uint16_t *indexes;
 
 
@@ -1019,7 +1105,7 @@ bool loadInstancedGeometryBuffers()
         instancedMeshVertexCount = 3;
         instancedMeshPrimitiveCount = 1;
 
-        vertices = (dja::vec2 *)verticesL0;
+        vertices = (Vec2 *)verticesL0;
         indexes = (uint16_t *)indexesL0;
     }
 #if USE_ADHOC_INSTANCED_GEOM
@@ -1027,21 +1113,21 @@ bool loadInstancedGeometryBuffers()
         instancedMeshVertexCount = 6;
         instancedMeshPrimitiveCount = 4;
 
-        vertices = (dja::vec2 *)verticesL1;
+        vertices = (Vec2 *)verticesL1;
         indexes = (uint16_t *)indexesL1;
     }
     else if(g_terrain.baseSubdivisionLevel == 2) {
         instancedMeshVertexCount = 15;
         instancedMeshPrimitiveCount = 16;
 
-        vertices = (dja::vec2 *)verticesL2;
+        vertices = (Vec2 *)verticesL2;
         indexes = (uint16_t *)indexesL2;
     }
     else if(g_terrain.baseSubdivisionLevel == 3) {
         instancedMeshVertexCount = 45;
         instancedMeshPrimitiveCount = 64;
 
-        vertices = (dja::vec2 *)verticesL3;
+        vertices = (Vec2 *)verticesL3;
         indexes = (uint16_t *)indexesL3;
     }
 #endif
@@ -1053,28 +1139,30 @@ bool loadInstancedGeometryBuffers()
         instancedMeshVertexCount = stripCnt * 4;
         instancedMeshPrimitiveCount = triangleCnt;
 
-        vertices = new dja::vec2[instancedMeshVertexCount];
+        vertices = new Vec2[instancedMeshVertexCount];
         indexes = new uint16_t[instancedMeshPrimitiveCount * 3];
         buffAllocated = true;
 
-        for (int i = 0; i < stripCnt; ++i) {
+        for (int i = 0; i < stripCnt; ++i)
+		{
             uint32_t key = i + stripCnt;
-            dja::mat3 xf = keyToXform(key);
-            dja::vec3 u1 = xf * dja::vec3(0.0f, 1.0f, 1.0f);
-            dja::vec3 u2 = xf * dja::vec3(0.0f, 0.0f, 1.0f);
-            dja::vec3 u3 = xf * dja::vec3(0.5f, 0.5f, 1.0f);
-            dja::vec3 u4 = xf * dja::vec3(1.0f, 0.0f, 1.0f);
+            Mat3x3 xf = keyToXform(key);
+            Vec3 u1 = Transform(xf, Vec3(0.0f, 1.0f, 1.0f));
+            Vec3 u2 = Transform(xf, Vec3(0.0f, 0.0f, 1.0f));
+            Vec3 u3 = Transform(xf, Vec3(0.5f, 0.5f, 1.0f));
+            Vec3 u4 = Transform(xf, Vec3(1.0f, 0.0f, 1.0f));
 
             // make sure triangle array is counter-clockwise
             if(subdLevel & 1) std::swap(u2, u3);
 
-            vertices[4 * i] = dja::vec2(u1.x, u1.y);
-            vertices[1 + 4 * i] = dja::vec2(u2.x, u2.y);
-            vertices[2 + 4 * i] = dja::vec2(u3.x, u3.y);
-            vertices[3 + 4 * i] = dja::vec2(u4.x, u4.y);
+            vertices[0 + 4 * i] = Vec2(u1.x, u1.y);
+            vertices[1 + 4 * i] = Vec2(u2.x, u2.y);
+            vertices[2 + 4 * i] = Vec2(u3.x, u3.y);
+            vertices[3 + 4 * i] = Vec2(u4.x, u4.y);
         }
 
-        for (int i = 0; i < triangleCnt; ++i) {
+        for (int i = 0; i < triangleCnt; ++i)
+		{
             int e = i & 1; // 0 if even, 1 if odd
 
             indexes[3 * i] = i * 2;
@@ -1089,7 +1177,7 @@ bool loadInstancedGeometryBuffers()
     if(!glIsBuffer(g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]))
         glGenBuffers(1, &g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
 
-    GLsizeiptr allocVertexBufferSize = sizeof(dja::vec2) * instancedMeshVertexCount;
+    GLsizeiptr allocVertexBufferSize = sizeof(Vec2) * instancedMeshVertexCount;
     allocVertexBufferSize = ((allocVertexBufferSize + bufferAllocationGranularity - 1) / bufferAllocationGranularity) * bufferAllocationGranularity;
     glBindBuffer(GL_ARRAY_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
 
@@ -1099,7 +1187,7 @@ bool loadInstancedGeometryBuffers()
 	#else
 	glBufferData(GL_ARRAY_BUFFER, allocVertexBufferSize, 0, GL_STATIC_DRAW);
 	#endif
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(dja::vec2) * instancedMeshVertexCount, (const void*)vertices);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(Vec2) * instancedMeshVertexCount, (const void*)vertices);
 
 	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES], "BUFFER_INSTANCED_GEOMETRY_VERTICES");
 
@@ -2140,19 +2228,17 @@ void mouseMotionCallback(GLFWwindow* window, double x, double y)
         return;
 
     if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-        dja::mat3 axis = dja::transpose(g_camera.axis);
-        g_camera.axis = dja::mat3::rotation(dja::vec3(0, 0, 1), dx * 5e-3)
-            * g_camera.axis;
-        g_camera.axis = dja::mat3::rotation(axis[1], dy * 5e-3)
-            * g_camera.axis;
-        g_camera.axis[0] = dja::normalize(g_camera.axis[0]);
-        g_camera.axis[1] = dja::normalize(g_camera.axis[1]);
-        g_camera.axis[2] = dja::normalize(g_camera.axis[2]);
+        Mat3x3 axis = Transpose(g_camera.axis);
+        g_camera.axis = Mat3x3Rotation(Vec3(0, 0, 1), dx * 5e-3) * g_camera.axis;
+        g_camera.axis = Mat3x3Rotation(axis[1], dy * 5e-3) * g_camera.axis;
+        g_camera.axis[0] = Normalize(g_camera.axis[0]);
+        g_camera.axis[1] = Normalize(g_camera.axis[1]);
+        g_camera.axis[2] = Normalize(g_camera.axis[2]);
     }
     else if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
-        dja::mat3 axis = dja::transpose(g_camera.axis);
-        g_camera.pos -= axis[1] * dx * 5e-3 * norm(g_camera.pos);
-        g_camera.pos += axis[2] * dy * 5e-3 * norm(g_camera.pos);
+        Mat3x3 axis = Transpose(g_camera.axis);
+        g_camera.pos -= axis[1] * dx * 5e-3 * Length(g_camera.pos);
+        g_camera.pos += axis[2] * dy * 5e-3 * Length(g_camera.pos);
     }
 
     x0 = x;
@@ -2166,7 +2252,7 @@ void mouseScrollCallback(GLFWwindow* window, double xoffset, double yoffset)
     if(io.WantCaptureMouse)
         return;
 
-    dja::mat3 axis = dja::transpose(g_camera.axis);
+    Mat3x3 axis = Transpose(g_camera.axis);
     g_camera.pos -= axis[0] * yoffset * 5e-2 * norm(g_camera.pos);
 }
 
@@ -2260,7 +2346,7 @@ int main(int argc, char **argv)
 ////Instanced patch geometry at various subdiv levels////
 
 //baseSubdivisionLevel == 0
-const dja::vec2 verticesL0[] = {
+const Vec2 verticesL0[] = {
     { 0.0f, 0.0f },
     { 1.0f, 0.0f },
     { 0.0f, 1.0f }
@@ -2268,7 +2354,7 @@ const dja::vec2 verticesL0[] = {
 const uint16_t indexesL0[] = { 0u, 1u, 2u };
 
 //baseSubdivisionLevel == 1
-const dja::vec2 verticesL1[] = {
+const Vec2 verticesL1[] = {
     { 0.0f, 1.0f },
     { 0.5f, 0.5f },
     { 0.0f, 0.5f },
@@ -2284,7 +2370,7 @@ const uint16_t indexesL1[] = {
 };
 
 //baseSubdivisionLevel == 2
-const dja::vec2 verticesL2[] = {
+const Vec2 verticesL2[] = {
     { 0.25f, 0.75f },
     { 0.0f, 1.0f },
     { 0.0f, 0.75f },
@@ -2325,7 +2411,7 @@ const uint16_t indexesL2[] = {
 };
 
 //baseSubdivisionLevel == 3
-const dja::vec2 verticesL3[] = {
+const Vec2 verticesL3[] = {
     { 0.25f*0.5f, 0.75f*0.5f + 0.5f },
     { 0.0f*0.5f, 1.0f*0.5f + 0.5f },
     { 0.0f*0.5f, 0.75f*0.5f + 0.5f },
