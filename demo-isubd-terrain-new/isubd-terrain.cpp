@@ -48,8 +48,20 @@
 #define USE_ADHOC_INSTANCED_GEOM        1
 
 
+constexpr size_t kSizeOfSubdBufferEntry = 2 * sizeof(uint32_t); // { primID, key }
+
+constexpr size_t kMaxNumSubdivisionLevel	 = 20;
+constexpr size_t kMaxNumSubdivisions		 = 1 << kMaxNumSubdivisionLevel;
+constexpr size_t kSubdivisionsBufferCapacity = kSizeOfSubdBufferEntry * kMaxNumSubdivisions;
+
+// Note: total subdivisions buffer capacity = 3 * kSubdivisionsBufferCapacity
+//	-> double-buffered subdivisions buffer + subdivisions buffer of visible triangles
+//  --> can be reduced to 2 * kSubdivisionsBufferCapacity if the visibility is computed afterwards from ping to pong buffer
+
+
 // TODO:
 //  - try 16-bit UV (i_TessCoord)
+//  - pack primID and key (in the case of terrain primID is 1-bit { 0, 1 } <-> 2 triangles of quad)
 
 ////////////////////////////////////////////////////////////////////////////////
 // Compatibility layer
@@ -263,7 +275,7 @@ enum
     BUFFER_GEOMETRY_VERTICES = STREAM_COUNT,
     BUFFER_GEOMETRY_INDEXES,
     BUFFER_SUBD1, BUFFER_SUBD2,
-    BUFFER_CULLED_SUBD1,                        // compute-based pipeline only
+    BUFFER_VISIBLE_SUBD,                        // compute-based pipeline only
     BUFFER_INSTANCED_GEOMETRY_VERTICES,         // compute-based pipeline only
     BUFFER_INSTANCED_GEOMETRY_INDEXES,          // compute-based pipeline only
     BUFFER_DISPATCH_INDIRECT,                   // compute-based pipeline only
@@ -331,13 +343,13 @@ extern const Vec2 verticesL0[3];
 extern const uint16_t indexesL0[3];
 
 extern const Vec2 verticesL1[6];
-extern const uint16_t indexesL1[12];
+extern const uint16_t indexesL1[12]; // 4 x 3
 
 extern const Vec2 verticesL2[15];
-extern const uint16_t indexesL2[48];
+extern const uint16_t indexesL2[48]; // 16 x 3
 
 extern const Vec2 verticesL3[45];
-extern const uint16_t indexesL3[192];
+extern const uint16_t indexesL3[192]; // 64 * 3
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility functions
@@ -544,9 +556,9 @@ void setShaderMacros(djg_program *djp)
     djgp_push_string(djp, "#define BUFFER_BINDING_INSTANCED_GEOMETRY_INDEXES %i\n", BUFFER_INSTANCED_GEOMETRY_INDEXES);
     djgp_push_string(djp, "#define BUFFER_BINDING_SUBD1 %i\n", BUFFER_SUBD1);
     djgp_push_string(djp, "#define BUFFER_BINDING_SUBD2 %i\n", BUFFER_SUBD2);
-    djgp_push_string(djp, "#define BUFFER_BINDING_CULLED_SUBD %i\n", BUFFER_CULLED_SUBD1);
+    djgp_push_string(djp, "#define BUFFER_BINDING_VISIBLE_SUBD %i\n", BUFFER_VISIBLE_SUBD);
     djgp_push_string(djp, "#define BUFFER_BINDING_SUBD_COUNTER %i\n", BINDING_SUBD_ATOMIC_COUNTER);
-    djgp_push_string(djp, "#define BUFFER_BINDING_CULLED_SUBD_COUNTER %i\n", BINDING_VISIBLE_SUBD_ATOMIC_COUNTER);
+    djgp_push_string(djp, "#define BUFFER_BINDING_VISIBLE_SUBD_COUNTER %i\n", BINDING_VISIBLE_SUBD_ATOMIC_COUNTER);
     djgp_push_string(djp, "#define BUFFER_BINDING_INDIRECT_COMMAND %i\n", BUFFER_DISPATCH_INDIRECT);
 }
 
@@ -1253,21 +1265,18 @@ void loadSubdBuffer(int id, size_t bufferCapacity)
 bool loadSubdivisionBuffers()
 {
     LOG("Loading {Subd-Buffer}\n");
-    //const size_t bufferCapacity = 1 << 28; // 256MB
-    const size_t bufferCapacity = 1 << 22;
 
-    loadSubdBuffer(BUFFER_SUBD1, bufferCapacity);
+    loadSubdBuffer(BUFFER_SUBD1, kSubdivisionsBufferCapacity);
 	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_SUBD1], "BUFFER_SUBD1");
 
-    loadSubdBuffer(BUFFER_SUBD2, bufferCapacity);
+    loadSubdBuffer(BUFFER_SUBD2, kSubdivisionsBufferCapacity);
 	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_SUBD2], "BUFFER_SUBD2");
 
     if(g_terrain.method == METHOD_CS)
 	{
         LOG("Loading {Culled-Subd-Buffer}\n");
-        loadSubdBuffer(BUFFER_CULLED_SUBD1, bufferCapacity);
-		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_CULLED_SUBD1], "BUFFER_CULLED_SUBD1");
-        //loadSubdBuffer(BUFFER_CULLED_SUBD2, bufferCapacity);
+        loadSubdBuffer(BUFFER_VISIBLE_SUBD, kSubdivisionsBufferCapacity);
+		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_VISIBLE_SUBD], "BUFFER_VISIBLE_SUBD");
     }
 
     return (glGetError() == GL_NO_ERROR);
@@ -1599,50 +1608,36 @@ void callUpdateIndirectProgram(
  * triangle. Note that this pipeline is essentially the same as the compute
  * pipeline, but done in one pass instead of two.
  */
-void renderSceneTs() {
-    static int offset = 0;
-    int nextOffset = 0;
-
+void renderSceneTs()
+{
     // render terrain
     glPatchParameteri(GL_PATCH_VERTICES, 1);
-    if(g_terrain.flags.reset) {
+    if(g_terrain.flags.reset)
+	{
         IndirectCommand drawArrays = { 2u, 1u, 0u, 0u, 0u, 0u, 0u, 0u };
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
         loadSubdivisionBuffers();
-        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER,
-                                    BUFFER_DRAW_INDIRECT,
-                                    drawArrays);
+        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER, BUFFER_DRAW_INDIRECT, drawArrays);
         createAtomicCounters(atomicData);
 
         g_terrain.pingPong = 1;
-        offset = 0;
         g_terrain.flags.reset = false;
     }
 
     // render the terrain
-    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_SUBD_ATOMIC_COUNTER,
-                     g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD1,
-                     g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD2,
-                     g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD1, g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD2, g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
     glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
     glUseProgram(g_gl.programs[PROGRAM_TERRAIN]);
     glDrawArraysIndirect(GL_PATCHES, 0);
 
     // prepare next batch
-    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT_DRAW,
-                              g_gl.buffers[BUFFER_ATOMIC_COUNTER],
-                              0, 0, 0,
-                              g_gl.buffers[BUFFER_DRAW_INDIRECT]);
+    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT_DRAW, g_gl.buffers[BUFFER_ATOMIC_COUNTER], 0, 0, 0, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
 
     g_terrain.pingPong = 1 - g_terrain.pingPong;
-    offset = nextOffset;
 }
 
 // -----------------------------------------------------------------------------
@@ -1656,49 +1651,35 @@ void renderSceneTs() {
  * Note that this pipeline is essentially the same as the compute pipeline,
  * but done in one pass instead of two.
  */
-void renderSceneGs() {
-    static int offset = 0;
-    int nextOffset = 0;
-
+void renderSceneGs()
+{
     // render terrain
-    if(g_terrain.flags.reset) {
+    if(g_terrain.flags.reset)
+	{
         IndirectCommand drawArrays = { 2u, 1u, 0u, 0u, 0u, 0u, 0u, 0u };
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
         loadSubdivisionBuffers();
-        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER,
-                                    BUFFER_DRAW_INDIRECT,
-                                    drawArrays);
+        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER, BUFFER_DRAW_INDIRECT, drawArrays);
         createAtomicCounters(atomicData);
 
         g_terrain.pingPong = 1;
-        offset = 0;
         g_terrain.flags.reset = false;
     }
 
     // render terrain
-    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_SUBD_ATOMIC_COUNTER,
-                     g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD1,
-                     g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD2,
-                     g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD1, g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD2, g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
     glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
     glUseProgram(g_gl.programs[PROGRAM_TERRAIN]);
     glDrawArraysIndirect(GL_POINTS, 0);
 
     // update indirect draw call
-    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT_DRAW,
-                              g_gl.buffers[BUFFER_ATOMIC_COUNTER],
-                              0, 0, 0,
-                              g_gl.buffers[BUFFER_DRAW_INDIRECT]);
+    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT_DRAW, g_gl.buffers[BUFFER_ATOMIC_COUNTER], 0, 0, 0, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
 
     g_terrain.pingPong = 1 - g_terrain.pingPong;
-    offset = nextOffset;
 }
 
 // -----------------------------------------------------------------------------
@@ -1712,12 +1693,11 @@ void renderSceneGs() {
  * Note that this pipeline is essentially the same as the compute pipeline,
  * but done in one pass instead of two.
  */
-void renderSceneMs() {
-    static int offset = 0;
-    int nextOffset = 0;
-
+void renderSceneMs()
+{
     // Init
-    if(g_terrain.flags.reset) {
+    if(g_terrain.flags.reset)
+	{
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         IndirectCommand cmd = {
             2u / (1u << g_terrain.computeThreadCount) + 1u,
@@ -1726,37 +1706,21 @@ void renderSceneMs() {
 
         loadSubdivisionBuffers();
         createAtomicCounters(atomicData);
-        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER,
-                                    BUFFER_DISPATCH_INDIRECT,
-                                    cmd);
+        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER, BUFFER_DISPATCH_INDIRECT, cmd);
 
         g_terrain.pingPong = 1;
-        offset = 0;
         g_terrain.flags.reset = false;
     }
 
     // Bind buffers to binding points
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_INSTANCED_GEOMETRY_VERTICES,
-                     g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_INSTANCED_GEOMETRY_INDEXES,
-                     g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_INSTANCED_GEOMETRY_VERTICES, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_INSTANCED_GEOMETRY_INDEXES, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
     glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD1,
-                     g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD2,
-                     g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
-    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_SUBD_ATOMIC_COUNTER,
-                     g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_DISPATCH_INDIRECT,
-                     g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER,
-                 g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD1, g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD2, g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_DISPATCH_INDIRECT, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
+	glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
 
     // draw terrain
     glUseProgram(g_gl.programs[PROGRAM_TERRAIN]);
@@ -1769,7 +1733,6 @@ void renderSceneMs() {
                               g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
 
     g_terrain.pingPong = 1 - g_terrain.pingPong;
-    offset = nextOffset;
 }
 
 // -----------------------------------------------------------------------------
@@ -1783,9 +1746,6 @@ void renderSceneMs() {
  */
 void renderSceneCs()
 {
-    static int offset = 0;
-    int nextOffset = 0;
-
     // update the subd buffers
     if(g_terrain.flags.reset)
 	{
@@ -1805,10 +1765,6 @@ void renderSceneCs()
 		// g_terrain.baseSubdivisionLevel = 1 -> subdLevel =  1 --> cnt = 12  (4 subtriangles)
 		// g_terrain.baseSubdivisionLevel = 2 -> subdLevel =  3 --> cnt = 48  (16 subtriangles)
 		// g_terrain.baseSubdivisionLevel = 3 -> subdLevel =  5 --> cnt = 192 (64 subtriangles)
-		// TODO: it seems that subdLevel is not really correct...
-		// -> subdLevel 1 should produce 2 subtriangles
-		// -> subdLevel 2 should produce 4 subtriangles
-		// -> subdLevel 3 should produce 8 subtriangles
         const int subdLevel = 2 * g_terrain.baseSubdivisionLevel - 1;
         const uint32_t vertexCount = subdLevel > 0 ? (6u << subdLevel) : 3u;
         IndirectCommand drawElements = {
@@ -1830,17 +1786,16 @@ void renderSceneCs()
 		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT], "BUFFER_DRAW_INDIRECT");
 
         g_terrain.pingPong = 1;
-        offset = 0;
         g_terrain.flags.reset = false;
     }
 
 	// Bind all buffers used by the update and draw passes
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD1, g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);	// Subdivision buffer - ping
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD2, g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);		// Subdivision buffer - pong
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_CULLED_SUBD1, g_gl.buffers[BUFFER_CULLED_SUBD1]);				// Subdivision buffer of visible triangles
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_VISIBLE_SUBD, g_gl.buffers[BUFFER_VISIBLE_SUBD]);				// Subdivision buffer of visible triangles
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_DISPATCH_INDIRECT, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);	// Dispatch indirect params buffer
-    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);		// Subdivision buffer atomic counter
-	glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, BINDING_VISIBLE_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_DRAW_INDIRECT], /*offset*/ sizeof(int), /*size*/ sizeof(int)); // // Subdivision buffer of visible triangles atomic counter
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);	// Subdivision buffer atomic counter
+	glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, BINDING_VISIBLE_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_DRAW_INDIRECT], /*offset*/ sizeof(int), /*size*/ sizeof(int)); // Subdivision buffer of visible triangles atomic counter
 
     // Compute the triangles LODs and update the subdivision buffer (LodKernel)
     glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]); // Dispatch indirect params buffer
@@ -1850,7 +1805,7 @@ void renderSceneCs()
     // Render the terrain (RenderKernel)
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
     glUseProgram(g_gl.programs[PROGRAM_TERRAIN]);
-    glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]); // The VAO references the patch vertex and index buffers (which data depends on the basic patch subdivision level)
+    glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]); // The VAO references the base tesselated triangle vertex and index buffers (which data depends on the base subdivision level)
     glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
     glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, NULL);
 
@@ -1858,7 +1813,6 @@ void renderSceneCs()
     callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT, g_gl.buffers[BUFFER_ATOMIC_COUNTER], 0, g_gl.buffers[BUFFER_DRAW_INDIRECT], sizeof(int), g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
 
     g_terrain.pingPong = 1 - g_terrain.pingPong;
-    offset = nextOffset;
 }
 
 // -----------------------------------------------------------------------------
@@ -1884,21 +1838,22 @@ void renderScene()
     loadTransformBuffer();
 
     // render
-    switch (g_terrain.method) {
-    case METHOD_TS:
-        renderSceneTs();
-        break;
-    case METHOD_GS:
-        renderSceneGs();
-        break;
-    case METHOD_CS:
-        renderSceneCs();
-        break;
-    case METHOD_MS:
-        renderSceneMs();
-        break;
-    default:
-        break;
+    switch (g_terrain.method)
+	{
+		case METHOD_TS:
+			renderSceneTs();
+			break;
+		case METHOD_GS:
+			renderSceneGs();
+			break;
+		case METHOD_CS:
+			renderSceneCs();
+			break;
+		case METHOD_MS:
+			renderSceneMs();
+			break;
+		default:
+			break;
     }
 
     // reset GL state

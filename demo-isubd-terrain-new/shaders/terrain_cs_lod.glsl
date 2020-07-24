@@ -16,7 +16,7 @@ readonly buffer SubdBufferIn {
     uvec2 u_SubdBufferIn[];
 };
 
-layout (std430, binding = BUFFER_BINDING_CULLED_SUBD)
+layout (std430, binding = BUFFER_BINDING_VISIBLE_SUBD)
 buffer CulledSubdBuffer {
     uvec2 u_CulledSubdBuffer[];
 };
@@ -27,7 +27,7 @@ buffer IndirectCommandBuffer {
 };
 
 //layout (binding = BUFFER_BINDING_SUBD_COUNTER, offset = 4)
-layout(binding = BUFFER_BINDING_CULLED_SUBD_COUNTER)
+layout(binding = BUFFER_BINDING_VISIBLE_SUBD_COUNTER)
 uniform atomic_uint u_CulledSubdBufferCounter;
 
 

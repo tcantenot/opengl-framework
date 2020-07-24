@@ -10,9 +10,9 @@
 // Implicit Subdivition Shader for Terrain Rendering
 //
 
-layout (std430, binding = BUFFER_BINDING_CULLED_SUBD)
-buffer CulledSubdBuffer {
-    uvec2 u_CulledSubdBuffer[];
+layout (std430, binding = BUFFER_BINDING_VISIBLE_SUBD)
+buffer VisibleSubdBuffer {
+    uvec2 u_VisibleSubdBuffer[];
 };
 
 
@@ -36,7 +36,7 @@ void main()
     int threadID = gl_InstanceID;
 
     // get coarse triangle associated to the key
-    uint primID = u_CulledSubdBuffer[threadID].x;
+    uint primID = u_VisibleSubdBuffer[threadID].x;
 	
 	#if 0
     vec3 v_in[3] = vec3[3](
@@ -55,7 +55,7 @@ void main()
 	#endif
 
     // compute sub-triangle associated to the key
-    uint key = u_CulledSubdBuffer[threadID].y;
+    uint key = u_VisibleSubdBuffer[threadID].y;
     vec3 v[3]; subd(key, v_in, v);
 
     // compute vertex location
