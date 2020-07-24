@@ -70,7 +70,7 @@ void main()
 
     bool isVisible = true;
 
-    uint key; vec4 v[3];
+    uint key; vec3 v[3];
 
     // early abort if the threadID exceeds the size of the subdivision buffer
     if (threadID >= u_IndirectCommand[7]) {   //Num triangles is stored in the last reserved field of the draw indiretc structure
@@ -81,15 +81,26 @@ void main()
 
         // get coarse triangle associated to the key
         uint primID = u_SubdBufferIn[threadID].x;
-        vec4 v_in[3] = vec4[3](
-            u_VertexBuffer[u_IndexBuffer[primID * 3    ]],
-            u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]],
-            u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]]
-        );
+
+		#if 0
+		vec3 v_in[3] = vec3[3](
+			u_VertexBuffer[u_IndexBuffer[primID * 3    ]].xyz,
+			u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]].xyz,
+			u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]].xyz
+		);
+		#else
+		// Terrain-specific optimization: the base primitive for the terrain is a quad with 2 triangles so primID is in { 0, 1 }
+		// --> reconstruct the triangle vertices from the primID { 0, 1 } w/o fetching from the index and vertex buffer
+		vec3 v_in[3] = vec3[3](
+			primID > 0 ? vec3(+1.0f, +1.0f, 0.0f) : vec3(-1.0f, -1.0f, 0.0f),
+			primID > 0 ? vec3(-1.0f, +1.0f, 0.0f) : vec3(+1.0f, -1.0f, 0.0f),
+			primID > 0 ? vec3(+1.0f, -1.0f, 0.0f) : vec3(-1.0f, +1.0f, 0.0f)
+		);
+		#endif
 
         // compute distance-based LOD
         key = u_SubdBufferIn[threadID].y;
-        vec4 vp[3]; subd(key, v_in, v, vp);
+        vec3 vp[3]; subd(key, v_in, v, vp);
         int targetLod = int(computeLod(v));
         int parentLod = int(computeLod(vp));
 #if FLAG_FREEZE
@@ -107,8 +118,8 @@ void main()
 
         // Cull invisible nodes
         mat4 mvp = u_Transform.modelViewProjection;
-        vec4 bmin = min(min(CULLING_USED_TRIANGLE[0], CULLING_USED_TRIANGLE[1]), CULLING_USED_TRIANGLE[2]);
-        vec4 bmax = max(max(CULLING_USED_TRIANGLE[0], CULLING_USED_TRIANGLE[1]), CULLING_USED_TRIANGLE[2]);
+        vec3 bmin = min(min(CULLING_USED_TRIANGLE[0], CULLING_USED_TRIANGLE[1]), CULLING_USED_TRIANGLE[2]);
+        vec3 bmax = max(max(CULLING_USED_TRIANGLE[0], CULLING_USED_TRIANGLE[1]), CULLING_USED_TRIANGLE[2]);
 
         // account for displacement in bound computations
 #   if FLAG_DISPLACE
@@ -116,7 +127,7 @@ void main()
         bmax.z = u_DmapFactor;
 #   endif
 #   if USE_SUBD_KEYS_CULLING==0 || FLAG_FREEZE == 0
-        isVisible = frustumCullingTest(mvp, bmin.xyz, bmax.xyz);
+        isVisible = frustumCullingTest(mvp, bmin, bmax);
 #   endif
 #endif // FLAG_CULL
 

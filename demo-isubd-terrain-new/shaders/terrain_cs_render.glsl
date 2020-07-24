@@ -22,6 +22,9 @@ buffer CulledSubdBuffer {
  *
  * This compute shader is responsible for updating the subdivision
  * buffer and visible buffer that will be sent to the rasterizer.
+ *
+ * 1.2.4 Conversion to Explicit Geometry
+ *   We instantiate a triangle for each subdivision key located in our subdivision buffer.
  */
 #ifdef VERTEX_SHADER
 layout(location = 0) in vec2 i_TessCoord;
@@ -34,18 +37,29 @@ void main()
 
     // get coarse triangle associated to the key
     uint primID = u_CulledSubdBuffer[threadID].x;
-    vec4 v_in[3] = vec4[3](
-        u_VertexBuffer[u_IndexBuffer[primID * 3    ]],
-        u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]],
-        u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]]
+	
+	#if 0
+    vec3 v_in[3] = vec3[3](
+        u_VertexBuffer[u_IndexBuffer[primID * 3    ]].xyz,
+        u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]].xyz,
+        u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]].xyz
     );
+	#else
+	// Terrain-specific optimization: the base primitive for the terrain is a quad with 2 triangles so primID is in { 0, 1 }
+	// --> reconstruct the triangle vertices from the primID { 0, 1 } w/o fetching from the index and vertex buffer
+	vec3 v_in[3] = vec3[3](
+		primID > 0 ? vec3(+1.0f, +1.0f, 0.0f) : vec3(-1.0f, -1.0f, 0.0f),
+		primID > 0 ? vec3(-1.0f, +1.0f, 0.0f) : vec3(+1.0f, -1.0f, 0.0f),
+		primID > 0 ? vec3(+1.0f, -1.0f, 0.0f) : vec3(-1.0f, +1.0f, 0.0f)
+	);
+	#endif
 
     // compute sub-triangle associated to the key
     uint key = u_CulledSubdBuffer[threadID].y;
-    vec4 v[3]; subd(key, v_in, v);
+    vec3 v[3]; subd(key, v_in, v);
 
     // compute vertex location
-    vec4 finalVertex = berp(v, i_TessCoord);
+    vec4 finalVertex = vec4(berp(v, i_TessCoord), 1);
 #if FLAG_DISPLACE
     finalVertex.z+= dmap(finalVertex.xy);
 #endif

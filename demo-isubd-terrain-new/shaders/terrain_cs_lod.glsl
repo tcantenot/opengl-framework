@@ -44,7 +44,9 @@ layout (local_size_x = COMPUTE_THREAD_COUNT,
         local_size_y = 1,
         local_size_z = 1) in;
 
-
+// TODO:
+// - send size of subdivision buffer to avoid overflow
+//  -> is it possible to detect overflow CPU-side?
 void main()
 {
     // get threadID (each key is associated to a thread)
@@ -57,17 +59,28 @@ void main()
 
     // get coarse triangle associated to the key
     uint primID = u_SubdBufferIn[threadID].x;
-    vec4 v_in[3] = vec4[3](
-        u_VertexBuffer[u_IndexBuffer[primID * 3]],
-        u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]],
-        u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]]
-        );
+
+	#if 0
+    vec3 v_in[3] = vec3[3](
+        u_VertexBuffer[u_IndexBuffer[primID * 3    ]].xyz,
+        u_VertexBuffer[u_IndexBuffer[primID * 3 + 1]].xyz,
+        u_VertexBuffer[u_IndexBuffer[primID * 3 + 2]].xyz
+    );
+	#else
+	// Terrain-specific optimization: the base primitive for the terrain is a quad with 2 triangles so primID is in { 0, 1 }
+	// --> reconstruct the triangle vertices from the primID { 0, 1 } w/o fetching from the index and vertex buffer
+	vec3 v_in[3] = vec3[3](
+		primID > 0 ? vec3(+1.0f, +1.0f, 0.0f) : vec3(-1.0f, -1.0f, 0.0f),
+		primID > 0 ? vec3(-1.0f, +1.0f, 0.0f) : vec3(+1.0f, -1.0f, 0.0f),
+		primID > 0 ? vec3(+1.0f, -1.0f, 0.0f) : vec3(-1.0f, +1.0f, 0.0f)
+	);
+	#endif
 
     // compute distance-based LOD
     uint key = u_SubdBufferIn[threadID].y;
-    vec4 v[3], vp[3]; subd(key, v_in, v, vp);
+    vec3 v[3], vp[3]; subd(key, v_in, v, vp);
     int targetLod = int(computeLod(v));
-    int parentLod = int(computeLod(vp));
+	int parentLod = int(computeLod(vp));
 #if FLAG_FREEZE
     targetLod = parentLod = findMSB(key);
 #endif
@@ -76,17 +89,17 @@ void main()
 #if FLAG_CULL
     // Cull invisible nodes
     mat4 mvp = u_Transform.modelViewProjection;
-    vec4 bmin = min(min(v[0], v[1]), v[2]);
-    vec4 bmax = max(max(v[0], v[1]), v[2]);
+    vec3 bmin = min(min(v[0], v[1]), v[2]);
+    vec3 bmax = max(max(v[0], v[1]), v[2]);
 
     // account for displacement in bound computations
-#   if FLAG_DISPLACE
+	#if FLAG_DISPLACE
     bmin.z = 0;
     bmax.z = u_DmapFactor;
-#   endif
+	#endif
 
     // update CulledSubdBuffer
-    if (/* is visible ? */frustumCullingTest(mvp, bmin.xyz, bmax.xyz)) {
+    if (/* is visible ? */frustumCullingTest(mvp, bmin, bmax)) {
 #else
     if (true) {
 #endif // FLAG_CULL

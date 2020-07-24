@@ -47,6 +47,16 @@
 //Forces use of ad-hoc instanced geometry definition, with better vertex reuse
 #define USE_ADHOC_INSTANCED_GEOM        1
 
+
+// TODO:
+//  - try 16-bit UV (i_TessCoord)
+
+void SetGLObjectLabel(GLenum identifier, GLuint name, const char * label)
+{
+	glObjectLabel(identifier, name, -1, label);
+}
+
+
 ////////////////////////////////////////////////////////////////////////////////
 // Global Variables
 //
@@ -88,6 +98,8 @@ struct CameraManager {
 enum { METHOD_TS, METHOD_GS, METHOD_CS, METHOD_MS };
 enum { SHADING_DIFFUSE, SHADING_NORMALS, SHADING_LOD };
 struct TerrainManager {
+	dja::vec3 pos;
+	dja::vec3 rotAnglesInDegrees;
     struct { bool displace, cull, freeze, wire, reset, freeze_step; } flags;
     struct {
         std::string pathToFile;
@@ -95,10 +107,12 @@ struct TerrainManager {
     } dmap;
     int method, computeThreadCount;
     int shading;
-    int gpuSubd;
+    int baseSubdivisionLevel; // Subdivision level of each instanced triangle (for each key in the subdivision buffer a (potentially) tesselated triangle is instanced)
     int pingPong;
     float primitivePixelLengthTarget;
 } g_terrain = {
+	{0.f, 0.f, 0.f},
+	{0.f, 0.f, 0.f},
     {true, true, false, false, true, false},
     {std::string(PATH_TO_ASSET_DIRECTORY "./dmap.png"), 0.45f},
     METHOD_CS, 5,
@@ -159,7 +173,9 @@ enum {
     TEXTURE_SMAP,
     TEXTURE_COUNT
 };
-enum {
+
+enum
+{
     BUFFER_GEOMETRY_VERTICES = STREAM_COUNT,
     BUFFER_GEOMETRY_INDEXES,
     BUFFER_SUBD1, BUFFER_SUBD2,
@@ -172,20 +188,26 @@ enum {
     BUFFER_ATOMIC_COUNTER2,                     // Just for the binding index
     BUFFER_COUNT
 };
+
 //Atomic counters bindings
-enum {
-    BINDING_ATOMIC_COUNTER,
-    BINDING_ATOMIC_COUNTER2
+enum
+{
+    BINDING_SUBD_ATOMIC_COUNTER,
+    BINDING_VISIBLE_SUBD_ATOMIC_COUNTER
 };
-enum {
+
+enum
+{
     PROGRAM_VIEWER,
-    PROGRAM_SUBD_CS_LOD,    // compute-based pipeline only
-    PROGRAM_TERRAIN,
-    PROGRAM_UPDATE_INDIRECT,    //Update indirect structures
+    PROGRAM_SUBD_CS_LOD,			// LOD computation and subdivision buffer update (compute-based pipeline only)
+    PROGRAM_TERRAIN,				// Terrain rendering
+    PROGRAM_UPDATE_INDIRECT,		// Prepares an indirect compute dispatch call for the next subdivision update
     PROGRAM_UPDATE_INDIRECT_DRAW,
     PROGRAM_COUNT
 };
-enum {
+
+enum
+{
     UNIFORM_VIEWER_FRAMEBUFFER_SAMPLER,
     UNIFORM_VIEWER_EXPOSURE,
     UNIFORM_VIEWER_GAMMA,
@@ -202,7 +224,9 @@ enum {
 
     UNIFORM_COUNT
 };
-struct OpenGLManager {
+
+struct OpenGLManager
+{
     GLuint programs[PROGRAM_COUNT];
     GLuint framebuffers[FRAMEBUFFER_COUNT];
     GLuint textures[TEXTURE_COUNT];
@@ -286,14 +310,14 @@ debug_output_logger(
     default: strcpy(typestr, "???"); break;
     }
 
-    if (severity == GL_DEBUG_SEVERITY_HIGH || severity == GL_DEBUG_SEVERITY_MEDIUM) {
+    if(severity == GL_DEBUG_SEVERITY_HIGH || severity == GL_DEBUG_SEVERITY_MEDIUM) {
         LOG("djg_debug_output: %s %s\n"                \
             "-- Begin -- GL_debug_output\n" \
             "%s\n"                              \
             "-- End -- GL_debug_output\n",
             srcstr, typestr, message);
     }
-    else if (severity == GL_DEBUG_SEVERITY_MEDIUM) {
+    else if(severity == GL_DEBUG_SEVERITY_MEDIUM) {
         LOG("djg_debug_output: %s %s\n"                 \
             "-- Begin -- GL_debug_output\n" \
             "%s\n"                              \
@@ -317,54 +341,33 @@ void log_debug_output(void)
 // set viewer program uniforms
 void configureViewerProgram()
 {
-    glProgramUniform1i(g_gl.programs[PROGRAM_VIEWER],
-        g_gl.uniforms[UNIFORM_VIEWER_FRAMEBUFFER_SAMPLER],
-        TEXTURE_SCENE);
-    glProgramUniform1f(g_gl.programs[PROGRAM_VIEWER],
-        g_gl.uniforms[UNIFORM_VIEWER_EXPOSURE],
-        g_app.viewer.exposure);
-    glProgramUniform1f(g_gl.programs[PROGRAM_VIEWER],
-        g_gl.uniforms[UNIFORM_VIEWER_GAMMA],
-        g_app.viewer.gamma);
+    glProgramUniform1i(g_gl.programs[PROGRAM_VIEWER], g_gl.uniforms[UNIFORM_VIEWER_FRAMEBUFFER_SAMPLER], TEXTURE_SCENE);
+    glProgramUniform1f(g_gl.programs[PROGRAM_VIEWER], g_gl.uniforms[UNIFORM_VIEWER_EXPOSURE], g_app.viewer.exposure);
+    glProgramUniform1f(g_gl.programs[PROGRAM_VIEWER], g_gl.uniforms[UNIFORM_VIEWER_GAMMA], g_app.viewer.gamma);
+}
+
+float ComputeLodFactor()
+{
+	return 2.0f * tan(radians(g_camera.fovy) / 2.0f) / g_framebuffer.w * (1 << g_terrain.baseSubdivisionLevel) * g_terrain.primitivePixelLengthTarget;
 }
 
 // -----------------------------------------------------------------------------
 // set terrain program uniforms
 void configureTerrainProgram()
 {
-    float lodFactor = 2.0f * tan(radians(g_camera.fovy) / 2.0f)
-        / g_framebuffer.w * (1 << g_terrain.gpuSubd)
-        * g_terrain.primitivePixelLengthTarget;
-
-    glProgramUniform1i(g_gl.programs[PROGRAM_TERRAIN],
-        g_gl.uniforms[UNIFORM_TERRAIN_DMAP_SAMPLER],
-        TEXTURE_DMAP);
-    glProgramUniform1i(g_gl.programs[PROGRAM_TERRAIN],
-        g_gl.uniforms[UNIFORM_TERRAIN_SMAP_SAMPLER],
-        TEXTURE_SMAP);
-    glProgramUniform1f(g_gl.programs[PROGRAM_TERRAIN],
-        g_gl.uniforms[UNIFORM_TERRAIN_DMAP_FACTOR],
-        g_terrain.dmap.scale);
-    glProgramUniform1f(g_gl.programs[PROGRAM_TERRAIN],
-        g_gl.uniforms[UNIFORM_TERRAIN_LOD_FACTOR],
-        lodFactor);
+    float lodFactor = ComputeLodFactor();
+    glProgramUniform1i(g_gl.programs[PROGRAM_TERRAIN], g_gl.uniforms[UNIFORM_TERRAIN_DMAP_SAMPLER], TEXTURE_DMAP);
+    glProgramUniform1i(g_gl.programs[PROGRAM_TERRAIN], g_gl.uniforms[UNIFORM_TERRAIN_SMAP_SAMPLER], TEXTURE_SMAP);
+    glProgramUniform1f(g_gl.programs[PROGRAM_TERRAIN], g_gl.uniforms[UNIFORM_TERRAIN_DMAP_FACTOR], g_terrain.dmap.scale);
+    glProgramUniform1f(g_gl.programs[PROGRAM_TERRAIN], g_gl.uniforms[UNIFORM_TERRAIN_LOD_FACTOR], lodFactor);
 }
 
 void configureSubdCsLodProgram()
 {
-    float lodFactor = 2.0f * tan(radians(g_camera.fovy) / 2.0f)
-        / g_framebuffer.w * (1 << g_terrain.gpuSubd)
-        * g_terrain.primitivePixelLengthTarget;
-
-    glProgramUniform1i(g_gl.programs[PROGRAM_SUBD_CS_LOD],
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_SAMPLER],
-        TEXTURE_DMAP);
-    glProgramUniform1f(g_gl.programs[PROGRAM_SUBD_CS_LOD],
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_FACTOR],
-        g_terrain.dmap.scale);
-    glProgramUniform1f(g_gl.programs[PROGRAM_SUBD_CS_LOD],
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_LOD_FACTOR],
-        lodFactor);
+    float lodFactor = ComputeLodFactor();
+	glProgramUniform1i(g_gl.programs[PROGRAM_SUBD_CS_LOD], g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_SAMPLER], TEXTURE_DMAP);
+    glProgramUniform1f(g_gl.programs[PROGRAM_SUBD_CS_LOD], g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_FACTOR], g_terrain.dmap.scale);
+    glProgramUniform1f(g_gl.programs[PROGRAM_SUBD_CS_LOD], g_gl.uniforms[UNIFORM_SUBD_CS_LOD_LOD_FACTOR], lodFactor);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -387,11 +390,11 @@ bool loadViewerProgram()
     char buf[1024];
 
     LOG("Loading {Viewer-Program}\n");
-    if (g_framebuffer.aa >= AA_MSAA2 && g_framebuffer.aa <= AA_MSAA16)
+    if(g_framebuffer.aa >= AA_MSAA2 && g_framebuffer.aa <= AA_MSAA16)
         djgp_push_string(djp, "#define MSAA_FACTOR %i\n", 1 << g_framebuffer.aa);
     djgp_push_file(djp, strcat2(buf, g_app.dir.shader, "viewer.glsl"));
 
-    if (!djgp_to_gl(djp, 450, false, true, program)) {
+    if(!djgp_to_gl(djp, 450, false, true, program)) {
         LOG("=> Failure <=\n");
         djgp_release(djp);
 
@@ -417,11 +420,11 @@ bool loadViewerProgram()
  */
 void setShaderMacros(djg_program *djp)
 {
-    if (g_terrain.flags.displace)
+    if(g_terrain.flags.displace)
         djgp_push_string(djp, "#define FLAG_DISPLACE 1\n");
-    if (g_terrain.flags.cull)
+    if(g_terrain.flags.cull)
         djgp_push_string(djp, "#define FLAG_CULL 1\n");
-    if (g_terrain.flags.freeze)
+    if(g_terrain.flags.freeze)
         djgp_push_string(djp, "#define FLAG_FREEZE 1\n");
 
     switch (g_terrain.shading) {
@@ -437,14 +440,14 @@ void setShaderMacros(djg_program *djp)
     }
 
     // constants
-    if (g_terrain.method == METHOD_GS) {
-        int subdLevel = g_terrain.gpuSubd;
+    if(g_terrain.method == METHOD_GS) {
+        int subdLevel = g_terrain.baseSubdivisionLevel;
         int vertexCnt = subdLevel == 0 ? 3 : 4 << (2 * subdLevel - 1);
 
         djgp_push_string(djp, "#define MAX_VERTICES %i\n", vertexCnt);
     }
-    djgp_push_string(djp, "#define PATCH_TESS_LEVEL %i\n",1 << g_terrain.gpuSubd);
-    djgp_push_string(djp, "#define PATCH_SUBD_LEVEL %i\n", g_terrain.gpuSubd);
+    djgp_push_string(djp, "#define PATCH_TESS_LEVEL %i\n",1 << g_terrain.baseSubdivisionLevel);
+    djgp_push_string(djp, "#define PATCH_SUBD_LEVEL %i\n", g_terrain.baseSubdivisionLevel);
     djgp_push_string(djp, "#define INSTANCED_MESH_VERTEX_COUNT %i\n", instancedMeshVertexCount);
     djgp_push_string(djp, "#define INSTANCED_MESH_PRIMITIVE_COUNT %i\n", instancedMeshPrimitiveCount);
     djgp_push_string(djp, "#define COMPUTE_THREAD_COUNT %i\n", 1u << g_terrain.computeThreadCount); //Compute Shader + Mesh Shader + Batch Program
@@ -458,8 +461,8 @@ void setShaderMacros(djg_program *djp)
     djgp_push_string(djp, "#define BUFFER_BINDING_SUBD1 %i\n", BUFFER_SUBD1);
     djgp_push_string(djp, "#define BUFFER_BINDING_SUBD2 %i\n", BUFFER_SUBD2);
     djgp_push_string(djp, "#define BUFFER_BINDING_CULLED_SUBD %i\n", BUFFER_CULLED_SUBD1);
-    djgp_push_string(djp, "#define BUFFER_BINDING_SUBD_COUNTER %i\n", BINDING_ATOMIC_COUNTER);
-    djgp_push_string(djp, "#define BUFFER_BINDING_CULLED_SUBD_COUNTER %i\n", BINDING_ATOMIC_COUNTER2);
+    djgp_push_string(djp, "#define BUFFER_BINDING_SUBD_COUNTER %i\n", BINDING_SUBD_ATOMIC_COUNTER);
+    djgp_push_string(djp, "#define BUFFER_BINDING_CULLED_SUBD_COUNTER %i\n", BINDING_VISIBLE_SUBD_ATOMIC_COUNTER);
     djgp_push_string(djp, "#define BUFFER_BINDING_INDIRECT_COMMAND %i\n", BUFFER_DISPATCH_INDIRECT);
 }
 
@@ -477,7 +480,7 @@ bool loadTerrainProgram()
     char buf[1024];
 
     LOG("Loading {Terrain-Program}\n");
-    if (g_terrain.method == METHOD_MS) {
+    if(g_terrain.method == METHOD_MS) {
         djgp_push_string(djp, "#ifndef FRAGMENT_SHADER\n#extension GL_NV_mesh_shader : require\n#endif\n");
         djgp_push_string(djp, "#extension GL_NV_shader_thread_group : require\n");
         djgp_push_string(djp, "#extension GL_NV_shader_thread_shuffle : require\n");
@@ -505,7 +508,7 @@ bool loadTerrainProgram()
         break;
     }
 
-    if (!djgp_to_gl(djp, 450, false, true, program)) {
+    if(!djgp_to_gl(djp, 450, false, true, program)) {
         LOG("=> Failure <=\n");
         djgp_release(djp);
 
@@ -513,14 +516,10 @@ bool loadTerrainProgram()
     }
     djgp_release(djp);
 
-    g_gl.uniforms[UNIFORM_TERRAIN_DMAP_FACTOR] =
-        glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_DmapFactor");
-    g_gl.uniforms[UNIFORM_TERRAIN_DMAP_SAMPLER] =
-        glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_DmapSampler");
-    g_gl.uniforms[UNIFORM_TERRAIN_SMAP_SAMPLER] =
-        glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_SmapSampler");
-    g_gl.uniforms[UNIFORM_TERRAIN_LOD_FACTOR] =
-        glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_LodFactor");
+    g_gl.uniforms[UNIFORM_TERRAIN_DMAP_FACTOR]  = glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_DmapFactor");
+    g_gl.uniforms[UNIFORM_TERRAIN_DMAP_SAMPLER] = glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_DmapSampler");
+	g_gl.uniforms[UNIFORM_TERRAIN_SMAP_SAMPLER] = glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_SmapSampler");
+    g_gl.uniforms[UNIFORM_TERRAIN_LOD_FACTOR]   = glGetUniformLocation(g_gl.programs[PROGRAM_TERRAIN], "u_LodFactor");
 
     configureTerrainProgram();
 
@@ -538,7 +537,8 @@ bool loadTerrainProgram()
  */
 bool loadSubdCsLodProgram()
 {
-    if (g_terrain.method == METHOD_CS) {
+    if(g_terrain.method == METHOD_CS)
+	{
         djg_program *djp = djgp_create();
         GLuint *program = &g_gl.programs[PROGRAM_SUBD_CS_LOD];
         char buf[1024];
@@ -551,7 +551,7 @@ bool loadSubdCsLodProgram()
 
         djgp_push_file(djp, strcat2(buf, g_app.dir.shader, "terrain_cs_lod.glsl"));
 
-        if (!djgp_to_gl(djp, 450, false, true, program)) {
+        if(!djgp_to_gl(djp, 450, false, true, program)) {
             LOG("=> Failure <=\n");
             djgp_release(djp);
 
@@ -559,12 +559,9 @@ bool loadSubdCsLodProgram()
         }
         djgp_release(djp);
 
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_FACTOR] =
-            glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_DmapFactor");
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_SAMPLER] =
-            glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_DmapSampler");
-        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_LOD_FACTOR] =
-            glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_LodFactor");
+        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_FACTOR]  = glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_DmapFactor");
+        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_DMAP_SAMPLER] = glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_DmapSampler");
+        g_gl.uniforms[UNIFORM_SUBD_CS_LOD_LOD_FACTOR]   = glGetUniformLocation(g_gl.programs[PROGRAM_SUBD_CS_LOD], "u_LodFactor");
 
         configureSubdCsLodProgram();
     }
@@ -585,8 +582,8 @@ bool
 loadUpdateIndirectProgram(
     int programName,
     bool updateIndirectStruct,
-    bool resetCounter1,
-    bool resetCounter2,
+    bool resetSubdAtomicCounter,
+    bool resetVisibleSubdAtomicCounter,
     int updateOffset,
     int divideValue,
     int addValue
@@ -596,21 +593,21 @@ loadUpdateIndirectProgram(
     char buf[1024];
 
     LOG("Loading {Update-Indirect-Program}\n");
-    if (GLAD_GL_ARB_shader_atomic_counter_ops) {
+    if(GLAD_GL_ARB_shader_atomic_counter_ops) {
         djgp_push_string(djp, "#extension GL_ARB_shader_atomic_counter_ops : require\n");
         djgp_push_string(djp, "#define ATOMIC_COUNTER_EXCHANGE_ARB 1\n");
-    } else if (GLAD_GL_AMD_shader_atomic_counter_ops) {
+    } else if(GLAD_GL_AMD_shader_atomic_counter_ops) {
         djgp_push_string(djp, "#extension GL_AMD_shader_atomic_counter_ops : require\n");
         djgp_push_string(djp, "#define ATOMIC_COUNTER_EXCHANGE_AMD 1\n");
     }
 
     djgp_push_string(djp, "#define UPDATE_INDIRECT_STRUCT %i\n", updateIndirectStruct ? 1 : 0);
-    djgp_push_string(djp, "#define UPDATE_INDIRECT_RESET_COUNTER1 %i\n", resetCounter1 ? 1 : 0);
-    djgp_push_string(djp, "#define UPDATE_INDIRECT_RESET_COUNTER2 %i\n", resetCounter2 ? 1 : 0);
+    djgp_push_string(djp, "#define UPDATE_INDIRECT_RESET_SUBD_ATOMIC_COUNTER %i\n", resetSubdAtomicCounter ? 1 : 0);
+    djgp_push_string(djp, "#define UPDATE_INDIRECT_RESET_VISIBLE_SUBD_ATOMIC_COUNTER %i\n", resetVisibleSubdAtomicCounter ? 1 : 0);
 
     djgp_push_string(djp, "#define BUFFER_BINDING_INDIRECT_COMMAND %i\n", BUFFER_DISPATCH_INDIRECT);
-    djgp_push_string(djp, "#define BINDING_ATOMIC_COUNTER %i\n", BINDING_ATOMIC_COUNTER);
-    djgp_push_string(djp, "#define BINDING_ATOMIC_COUNTER2 %i\n", BINDING_ATOMIC_COUNTER2);
+    djgp_push_string(djp, "#define BINDING_SUBD_ATOMIC_COUNTER %i\n", BINDING_SUBD_ATOMIC_COUNTER);
+    djgp_push_string(djp, "#define BINDING_VISIBLE_SUBD_ATOMIC_COUNTER %i\n", BINDING_VISIBLE_SUBD_ATOMIC_COUNTER);
 
     djgp_push_string(djp, "#define UPDATE_INDIRECT_OFFSET %i\n", updateOffset);
     djgp_push_string(djp, "#define UPDATE_INDIRECT_VALUE_DIVIDE %i\n", divideValue);
@@ -618,7 +615,7 @@ loadUpdateIndirectProgram(
 
     djgp_push_file(djp, strcat2(buf, g_app.dir.shader, "terrain_updateIndirect_cs.glsl"));
 
-    if (!djgp_to_gl(djp, 450, false, true, program)) {
+    if(!djgp_to_gl(djp, 450, false, true, program)) {
         LOG("=> Failure <=\n");
         djgp_release(djp);
 
@@ -657,10 +654,10 @@ bool loadPrograms()
 {
     bool v = true;
 
-    if (v) v &= loadViewerProgram();
-    if (v) v &= loadTerrainProgram();
-    if (v) v &= loadSubdCsLodProgram();
-    if (v) v &= loadUpdateIndirectPrograms();
+    if(v) v &= loadViewerProgram();
+    if(v) v &= loadTerrainProgram();
+    if(v) v &= loadSubdCsLodProgram();
+    if(v) v &= loadUpdateIndirectPrograms();
 
     return v;
 }
@@ -681,77 +678,62 @@ bool loadPrograms()
  */
 bool loadSceneFramebufferTexture()
 {
-    if (glIsTexture(g_gl.textures[TEXTURE_SCENE]))
+    if(glIsTexture(g_gl.textures[TEXTURE_SCENE]))
         glDeleteTextures(1, &g_gl.textures[TEXTURE_SCENE]);
-    if (glIsTexture(g_gl.textures[TEXTURE_Z]))
+    if(glIsTexture(g_gl.textures[TEXTURE_Z]))
         glDeleteTextures(1, &g_gl.textures[TEXTURE_Z]);
     glGenTextures(1, &g_gl.textures[TEXTURE_Z]);
     glGenTextures(1, &g_gl.textures[TEXTURE_SCENE]);
 
-    switch (g_framebuffer.aa) {
-    case AA_NONE:
-        LOG("Loading {Scene-Z-Framebuffer-Texture}\n");
-        glActiveTexture(GL_TEXTURE0 + TEXTURE_Z);
-        glBindTexture(GL_TEXTURE_2D, g_gl.textures[TEXTURE_Z]);
-        glTexStorage2D(GL_TEXTURE_2D,
-            1,
-            GL_DEPTH24_STENCIL8,
-            g_framebuffer.w,
-            g_framebuffer.h);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    switch (g_framebuffer.aa)
+	{
+		case AA_NONE:
+			LOG("Loading {Scene-Z-Framebuffer-Texture}\n");
+			glActiveTexture(GL_TEXTURE0 + TEXTURE_Z);
+			glBindTexture(GL_TEXTURE_2D, g_gl.textures[TEXTURE_Z]);
+			glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH24_STENCIL8, g_framebuffer.w, g_framebuffer.h);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-        LOG("Loading {Scene-RGBA-Framebuffer-Texture}\n");
-        glActiveTexture(GL_TEXTURE0 + TEXTURE_SCENE);
-        glBindTexture(GL_TEXTURE_2D, g_gl.textures[TEXTURE_SCENE]);
-        glTexStorage2D(GL_TEXTURE_2D,
-            1,
-            GL_RGBA32F,
-            g_framebuffer.w,
-            g_framebuffer.h);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        break;
-    case AA_MSAA2:
-    case AA_MSAA4:
-    case AA_MSAA8:
-    case AA_MSAA16: {
-        int samples = 1 << g_framebuffer.aa;
+			LOG("Loading {Scene-RGBA-Framebuffer-Texture}\n");
+			glActiveTexture(GL_TEXTURE0 + TEXTURE_SCENE);
+			glBindTexture(GL_TEXTURE_2D, g_gl.textures[TEXTURE_SCENE]);
+			glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, g_framebuffer.w, g_framebuffer.h);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			break;
+		case AA_MSAA2:
+		case AA_MSAA4:
+		case AA_MSAA8:
+		case AA_MSAA16: {
+			int samples = 1 << g_framebuffer.aa;
         
-        int maxSamples;
-        int maxSamplesDepth;
-        //glGetIntegerv(GL_MAX_INTEGER_SAMPLES, &maxSamples); //Wrong enum !
-        glGetIntegerv(GL_MAX_COLOR_TEXTURE_SAMPLES, &maxSamples);
-        glGetIntegerv(GL_MAX_DEPTH_TEXTURE_SAMPLES, &maxSamplesDepth);
-        maxSamples = maxSamplesDepth < maxSamples ? maxSamplesDepth : maxSamples;
+			int maxSamples;
+			int maxSamplesDepth;
+			//glGetIntegerv(GL_MAX_INTEGER_SAMPLES, &maxSamples); //Wrong enum !
+			glGetIntegerv(GL_MAX_COLOR_TEXTURE_SAMPLES, &maxSamples);
+			glGetIntegerv(GL_MAX_DEPTH_TEXTURE_SAMPLES, &maxSamplesDepth);
+			maxSamples = maxSamplesDepth < maxSamples ? maxSamplesDepth : maxSamples;
 
-        if (samples > maxSamples) {
-            LOG("note: MSAA is %ix\n", maxSamples);
-            samples = maxSamples;
-        }
-        LOG("Loading {Scene-MSAA-Z-Framebuffer-Texture}\n");
-        glActiveTexture(GL_TEXTURE0 + TEXTURE_Z);
-        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, g_gl.textures[TEXTURE_Z]);
-        glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE,
-            samples,
-            GL_DEPTH24_STENCIL8,
-            g_framebuffer.w,
-            g_framebuffer.h,
-            g_framebuffer.msaa.fixed);
+			if(samples > maxSamples) {
+				LOG("note: MSAA is %ix\n", maxSamples);
+				samples = maxSamples;
+			}
+			LOG("Loading {Scene-MSAA-Z-Framebuffer-Texture}\n");
+			glActiveTexture(GL_TEXTURE0 + TEXTURE_Z);
+			glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, g_gl.textures[TEXTURE_Z]);
+			glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, samples, GL_DEPTH24_STENCIL8, g_framebuffer.w, g_framebuffer.h, g_framebuffer.msaa.fixed);
 
-        LOG("Loading {Scene-MSAA-RGBA-Framebuffer-Texture}\n");
-        glActiveTexture(GL_TEXTURE0 + TEXTURE_SCENE);
-        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE,
-            g_gl.textures[TEXTURE_SCENE]);
-        glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE,
-            samples,
-            GL_RGBA32F,
-            g_framebuffer.w,
-            g_framebuffer.h,
-            g_framebuffer.msaa.fixed);
-    } break;
+			LOG("Loading {Scene-MSAA-RGBA-Framebuffer-Texture}\n");
+			glActiveTexture(GL_TEXTURE0 + TEXTURE_SCENE);
+			glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, g_gl.textures[TEXTURE_SCENE]);
+			glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, samples, GL_RGBA32F, g_framebuffer.w, g_framebuffer.h,	g_framebuffer.msaa.fixed);
+		} break;
     }
     glActiveTexture(GL_TEXTURE0);
+
+	SetGLObjectLabel(GL_TEXTURE, g_gl.textures[TEXTURE_Z], "TEXTURE_Z");
+	SetGLObjectLabel(GL_TEXTURE, g_gl.textures[TEXTURE_SCENE], "TEXTURE_SCENE");
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -766,21 +748,19 @@ bool loadSceneFramebufferTexture()
 bool loadBackFramebufferTexture()
 {
     LOG("Loading {Back-Framebuffer-Texture}\n");
-    if (glIsTexture(g_gl.textures[TEXTURE_BACK]))
+    if(glIsTexture(g_gl.textures[TEXTURE_BACK]))
         glDeleteTextures(1, &g_gl.textures[TEXTURE_BACK]);
     glGenTextures(1, &g_gl.textures[TEXTURE_BACK]);
 
     glActiveTexture(GL_TEXTURE0 + TEXTURE_BACK);
     glBindTexture(GL_TEXTURE_2D, g_gl.textures[TEXTURE_BACK]);
-    glTexStorage2D(GL_TEXTURE_2D,
-        1,
-        GL_RGBA8,
-        g_app.viewer.w,
-        g_app.viewer.h);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, g_app.viewer.w, g_app.viewer.h);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     glActiveTexture(GL_TEXTURE0);
+
+	SetGLObjectLabel(GL_TEXTURE, g_gl.textures[TEXTURE_BACK], "TEXTURE_BACK");
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -820,7 +800,7 @@ void loadSmapTexture(const djg_texture *dmap)
             smap[1 + 2 * (i + w * j)] = slope_y;
         }
 
-    if (glIsTexture(g_gl.textures[TEXTURE_SMAP]))
+    if(glIsTexture(g_gl.textures[TEXTURE_SMAP]))
         glDeleteTextures(1, &g_gl.textures[TEXTURE_SMAP]);
 
     glGenTextures(1, &g_gl.textures[TEXTURE_SMAP]);
@@ -829,16 +809,12 @@ void loadSmapTexture(const djg_texture *dmap)
     glTexStorage2D(GL_TEXTURE_2D, mipcnt, GL_RG32F, w, h);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RG, GL_FLOAT, &smap[0]);
     glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D,
-        GL_TEXTURE_MIN_FILTER,
-        GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D,
-        GL_TEXTURE_WRAP_S,
-        GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D,
-        GL_TEXTURE_WRAP_T,
-        GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glActiveTexture(GL_TEXTURE0);
+
+	SetGLObjectLabel(GL_TEXTURE, g_gl.textures[TEXTURE_SMAP], "TEXTURE_SMAP");
 }
 
 /**
@@ -848,7 +824,8 @@ void loadSmapTexture(const djg_texture *dmap)
  */
 bool loadDmapTexture()
 {
-    if (!g_terrain.dmap.pathToFile.empty()) {
+    if(!g_terrain.dmap.pathToFile.empty())
+	{
         djg_texture *djgt = djgt_create(1);
         GLuint *glt = &g_gl.textures[TEXTURE_DMAP];
 
@@ -859,21 +836,15 @@ bool loadDmapTexture()
         loadSmapTexture(djgt);
 
         glActiveTexture(GL_TEXTURE0 + TEXTURE_DMAP);
-        if (!djgt_to_gl(djgt, GL_TEXTURE_2D, GL_R16, 1, 1, glt)) {
+        if(!djgt_to_gl(djgt, GL_TEXTURE_2D, GL_R16, 1, 1, glt)) {
             LOG("=> Failure <=\n");
             djgt_release(djgt);
 
             return false;
         }
-        glTexParameteri(GL_TEXTURE_2D,
-            GL_TEXTURE_MIN_FILTER,
-            GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_S,
-            GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_T,
-            GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glActiveTexture(GL_TEXTURE0);
         djgt_release(djgt);
     }
@@ -889,9 +860,9 @@ bool loadTextures()
 {
     bool v = true;
 
-    if (v) v &= loadSceneFramebufferTexture();
-    if (v) v &= loadBackFramebufferTexture();
-    if (v) v &= loadDmapTexture();
+    if(v) v &= loadSceneFramebufferTexture();
+    if(v) v &= loadBackFramebufferTexture();
+    if(v) v &= loadDmapTexture();
 
     return v;
 }
@@ -911,10 +882,10 @@ bool loadTransformBuffer()
 {
     static bool first = true;
     struct Transform {
-        dja::mat4 modelView, projection, modelViewProjection, viewInv;
+        dja::mat4 localToWorld, worldToView, viewToLocal, modelView, projection, modelViewProjection, _pad0, _pad1;
     } transform;
 
-    if (first) {
+    if(first) {
         g_gl.streams[STREAM_TRANSFORM] = djgb_create(sizeof(transform));
         first = false;
     }
@@ -928,26 +899,33 @@ bool loadTransformBuffer()
     );
     dja::mat4 viewInv = dja::mat4::homogeneous::translation(g_camera.pos)
         * dja::mat4::homogeneous::from_mat3(g_camera.axis);
-    dja::mat4 view = dja::inverse(viewInv);
+    dja::mat4 worldToView = dja::inverse(viewInv);
 
+	dja::mat4 rotX = dja::mat4::homogeneous::rotation(dja::vec3(1, 0, 0), g_terrain.rotAnglesInDegrees.x * M_PI / 180.f);
+	dja::mat4 rotY = dja::mat4::homogeneous::rotation(dja::vec3(0, 1, 0), g_terrain.rotAnglesInDegrees.y * M_PI / 180.f);
+	dja::mat4 rotZ = dja::mat4::homogeneous::rotation(dja::vec3(0, 0, 1), g_terrain.rotAnglesInDegrees.z * M_PI / 180.f);
+	dja::mat4 translation = dja::mat4::homogeneous::translation(g_terrain.pos);
+	dja::mat4 localToWorld = translation * rotX * rotY * rotZ;
 
     // set transformations
+	transform.localToWorld = localToWorld;
+	transform.worldToView = worldToView;
     transform.projection = projection;
-    transform.modelView = view;
+    transform.modelView = worldToView * localToWorld;
     transform.modelViewProjection = transform.projection * transform.modelView;
-    transform.viewInv = viewInv;
+    transform.viewToLocal = dja::inverse(worldToView * localToWorld);
 
 	// transpose manually for AMD
+	transform.localToWorld = dja::transpose(transform.localToWorld);
+	transform.worldToView = dja::transpose(transform.worldToView);
 	transform.projection = dja::transpose(transform.projection);
 	transform.modelView = dja::transpose(transform.modelView);
 	transform.modelViewProjection = dja::transpose(transform.modelViewProjection);
-	transform.viewInv = dja::transpose(transform.viewInv);
+	transform.viewToLocal = dja::transpose(transform.viewToLocal);
 
     // upload to GPU
     djgb_to_gl(g_gl.streams[STREAM_TRANSFORM], (const void *)&transform, NULL);
-    djgb_glbindrange(g_gl.streams[STREAM_TRANSFORM],
-        GL_UNIFORM_BUFFER,
-        STREAM_TRANSFORM);
+    djgb_glbindrange(g_gl.streams[STREAM_TRANSFORM], GL_UNIFORM_BUFFER, STREAM_TRANSFORM);
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -969,36 +947,31 @@ bool loadGeometryBuffers()
         {+1.0f, +1.0f, 0.0f, 1.0f},
         {-1.0f, +1.0f, 0.0f, 1.0f}
     };
-    if (glIsBuffer(g_gl.buffers[BUFFER_GEOMETRY_VERTICES]))
+    if(glIsBuffer(g_gl.buffers[BUFFER_GEOMETRY_VERTICES]))
         glDeleteBuffers(1, &g_gl.buffers[BUFFER_GEOMETRY_VERTICES]);
     glGenBuffers(1, &g_gl.buffers[BUFFER_GEOMETRY_VERTICES]);
     glBindBuffer(GL_ARRAY_BUFFER, g_gl.buffers[BUFFER_GEOMETRY_VERTICES]);
-    glBufferData(GL_ARRAY_BUFFER,
-        sizeof(vertices),
-        (const void*)vertices,
-        GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-        BUFFER_GEOMETRY_VERTICES,
-        g_gl.buffers[BUFFER_GEOMETRY_VERTICES]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_GEOMETRY_VERTICES, g_gl.buffers[BUFFER_GEOMETRY_VERTICES]);
+
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_GEOMETRY_VERTICES], "BUFFER_GEOMETRY_VERTICES");
 
     LOG("Loading {Mesh-Index-Buffer}\n");
-    const uint32_t indexes[] = {
+    const uint32_t indexes[] =
+	{
         0, 1, 3,
         2, 3, 1
     };
-    if (glIsBuffer(g_gl.buffers[BUFFER_GEOMETRY_INDEXES]))
+    if(glIsBuffer(g_gl.buffers[BUFFER_GEOMETRY_INDEXES]))
         glDeleteBuffers(1, &g_gl.buffers[BUFFER_GEOMETRY_INDEXES]);
     glGenBuffers(1, &g_gl.buffers[BUFFER_GEOMETRY_INDEXES]);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gl.buffers[BUFFER_GEOMETRY_INDEXES]);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-        sizeof(indexes),
-        (const void *)indexes,
-        GL_STATIC_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indexes), indexes, GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-        BUFFER_GEOMETRY_INDEXES,
-        g_gl.buffers[BUFFER_GEOMETRY_INDEXES]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_GEOMETRY_INDEXES, g_gl.buffers[BUFFER_GEOMETRY_INDEXES]);
+	
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_GEOMETRY_INDEXES], "BUFFER_GEOMETRY_INDEXES");
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -1037,11 +1010,11 @@ dja::mat3 keyToXform(uint32_t key)
 bool loadInstancedGeometryBuffers()
 {
     bool buffAllocated = false;
-    dja::vec2 *vertices;
+    dja::vec2 *vertices; // vec2 for uv (barycentric) coordinates (used to interpolate vertex positions, ...)
     uint16_t *indexes;
 
 
-    if (g_terrain.gpuSubd == 0) {
+    if(g_terrain.baseSubdivisionLevel == 0) {
 
         instancedMeshVertexCount = 3;
         instancedMeshPrimitiveCount = 1;
@@ -1050,21 +1023,21 @@ bool loadInstancedGeometryBuffers()
         indexes = (uint16_t *)indexesL0;
     }
 #if USE_ADHOC_INSTANCED_GEOM
-    else if (g_terrain.gpuSubd == 1) {
+    else if(g_terrain.baseSubdivisionLevel == 1) {
         instancedMeshVertexCount = 6;
         instancedMeshPrimitiveCount = 4;
 
         vertices = (dja::vec2 *)verticesL1;
         indexes = (uint16_t *)indexesL1;
     }
-    else if (g_terrain.gpuSubd == 2) {
+    else if(g_terrain.baseSubdivisionLevel == 2) {
         instancedMeshVertexCount = 15;
         instancedMeshPrimitiveCount = 16;
 
         vertices = (dja::vec2 *)verticesL2;
         indexes = (uint16_t *)indexesL2;
     }
-    else if (g_terrain.gpuSubd == 3) {
+    else if(g_terrain.baseSubdivisionLevel == 3) {
         instancedMeshVertexCount = 45;
         instancedMeshPrimitiveCount = 64;
 
@@ -1073,7 +1046,7 @@ bool loadInstancedGeometryBuffers()
     }
 #endif
     else {
-        int subdLevel = 2 * g_terrain.gpuSubd - 1;
+        int subdLevel = 2 * g_terrain.baseSubdivisionLevel - 1;
         int stripCnt = 1 << subdLevel;
         int triangleCnt = stripCnt * 2;
 
@@ -1093,7 +1066,7 @@ bool loadInstancedGeometryBuffers()
             dja::vec3 u4 = xf * dja::vec3(1.0f, 0.0f, 1.0f);
 
             // make sure triangle array is counter-clockwise
-            if (subdLevel & 1) std::swap(u2, u3);
+            if(subdLevel & 1) std::swap(u2, u3);
 
             vertices[4 * i] = dja::vec2(u1.x, u1.y);
             vertices[1 + 4 * i] = dja::vec2(u2.x, u2.y);
@@ -1113,32 +1086,48 @@ bool loadInstancedGeometryBuffers()
     const GLsizeiptr bufferAllocationGranularity = 2048;        //Avoids alignment issues
 
     LOG("Loading {Instanced-Vertex-Buffer}\n");
-    if (!glIsBuffer(g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES])) {
+    if(!glIsBuffer(g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]))
         glGenBuffers(1, &g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
-    }
+
     GLsizeiptr allocVertexBufferSize = sizeof(dja::vec2) * instancedMeshVertexCount;
     allocVertexBufferSize = ((allocVertexBufferSize + bufferAllocationGranularity - 1) / bufferAllocationGranularity) * bufferAllocationGranularity;
     glBindBuffer(GL_ARRAY_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
+
+	#if 0
+	// Note: error with RenderDoc (immutable buffer...)
     glBufferStorage(GL_ARRAY_BUFFER, allocVertexBufferSize, NULL, GL_DYNAMIC_STORAGE_BIT);
+	#else
+	glBufferData(GL_ARRAY_BUFFER, allocVertexBufferSize, 0, GL_STATIC_DRAW);
+	#endif
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(dja::vec2) * instancedMeshVertexCount, (const void*)vertices);
+
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES], "BUFFER_INSTANCED_GEOMETRY_VERTICES");
 
 
     LOG("Loading {Instanced-Index-Buffer}\n");
-    if (!glIsBuffer(g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES])) {
+    if(!glIsBuffer(g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]))
         glGenBuffers(1, &g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
-    }
+
     GLsizeiptr allocIndexBufferSize = sizeof(uint16_t) * instancedMeshPrimitiveCount * 3;
     allocIndexBufferSize = ((allocIndexBufferSize + bufferAllocationGranularity - 1) / bufferAllocationGranularity) * bufferAllocationGranularity;
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
+
+	#if 0
+	// Note: error with RenderDoc (immutable buffer...)
     glBufferStorage(GL_ELEMENT_ARRAY_BUFFER, allocIndexBufferSize, NULL, GL_DYNAMIC_STORAGE_BIT);
+	#else
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, allocIndexBufferSize, 0, GL_STATIC_DRAW);
+	#endif
     glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof(uint16_t) * instancedMeshPrimitiveCount * 3, (const void*)indexes);
 
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES], "BUFFER_INSTANCED_GEOMETRY_INDEXES");
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
 
-    if (buffAllocated) {
+    if(buffAllocated)
+	{
         delete[] vertices;
         delete[] indexes;
     }
@@ -1155,15 +1144,20 @@ bool loadInstancedGeometryBuffers()
  */
 void loadSubdBuffer(int id, size_t bufferCapacity)
 {
-    const uint32_t data[] = { 0, 1, 1, 1 };
+    const uint32_t data[] =
+	{
+		0, // subdBuffer[0].x = primID (triangle 0)
+		1, // subdBuffer[0].y = key	  (1 <=> root)
+		1, // subdBuffer[1].x = primID (triangle 1)
+		1  // subdBuffer[1].y = key    (1 <=> root)
+	};
 
-    if (glIsBuffer(g_gl.buffers[id]))
+    if(glIsBuffer(g_gl.buffers[id]))
         glDeleteBuffers(1, &g_gl.buffers[id]);
     glGenBuffers(1, &g_gl.buffers[id]);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, g_gl.buffers[id]);
     glBufferData(GL_SHADER_STORAGE_BUFFER, bufferCapacity, NULL, GL_STATIC_DRAW);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER,
-        0, sizeof(data), (const GLvoid *)data);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(data), (const GLvoid *)data);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, id, g_gl.buffers[id]);
 }
@@ -1171,13 +1165,20 @@ void loadSubdBuffer(int id, size_t bufferCapacity)
 bool loadSubdivisionBuffers()
 {
     LOG("Loading {Subd-Buffer}\n");
-    const size_t bufferCapacity = 1 << 28;
+    //const size_t bufferCapacity = 1 << 28; // 256MB
+    const size_t bufferCapacity = 1 << 22;
 
     loadSubdBuffer(BUFFER_SUBD1, bufferCapacity);
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_SUBD1], "BUFFER_SUBD1");
+
     loadSubdBuffer(BUFFER_SUBD2, bufferCapacity);
-    if (g_terrain.method == METHOD_CS) {
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_SUBD2], "BUFFER_SUBD2");
+
+    if(g_terrain.method == METHOD_CS)
+	{
         LOG("Loading {Culled-Subd-Buffer}\n");
         loadSubdBuffer(BUFFER_CULLED_SUBD1, bufferCapacity);
+		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_CULLED_SUBD1], "BUFFER_CULLED_SUBD1");
         //loadSubdBuffer(BUFFER_CULLED_SUBD2, bufferCapacity);
     }
 
@@ -1193,10 +1194,10 @@ bool loadBuffers()
 {
     bool v = true;
 
-    if (v) v &= loadTransformBuffer();
-    if (v) v &= loadGeometryBuffers();
-    if (v) v &= loadInstancedGeometryBuffers();
-    if (v) v &= loadSubdivisionBuffers();
+    if(v) v &= loadTransformBuffer();
+    if(v) v &= loadGeometryBuffers();
+    if(v) v &= loadInstancedGeometryBuffers();
+    if(v) v &= loadSubdivisionBuffers();
 
     return v;
 }
@@ -1216,11 +1217,12 @@ bool loadBuffers()
 bool loadEmptyVertexArray()
 {
     LOG("Loading {Empty-VertexArray}\n");
-    if (glIsVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]))
+    if(glIsVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]))
         glDeleteVertexArrays(1, &g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
 
     glGenVertexArrays(1, &g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
     glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_EMPTY]);
+	SetGLObjectLabel(GL_VERTEX_ARRAY, g_gl.vertexArrays[VERTEXARRAY_EMPTY], "VERTEXARRAY_EMPTY");
     glBindVertexArray(0);
 
     return (glGetError() == GL_NO_ERROR);
@@ -1236,19 +1238,17 @@ bool loadEmptyVertexArray()
 bool loadInstancedGeometryVertexArray()
 {
     LOG("Loading {Instanced-Grid-VertexArray}\n");
-    if (glIsVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]))
+    if(glIsVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]))
         glDeleteVertexArrays(1, &g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]);
 
     glGenVertexArrays(1, &g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]);
     glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]);
+	SetGLObjectLabel(GL_VERTEX_ARRAY, g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID], "VERTEXARRAY_INSTANCED_GRID");
     glEnableVertexAttribArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER,
-        g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
+    glBindBuffer(GL_ARRAY_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_VERTICES]);
     glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, BUFFER_OFFSET(0));
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,
-        g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
-
-    glBindVertexArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_gl.buffers[BUFFER_INSTANCED_GEOMETRY_INDEXES]);
+	glBindVertexArray(0);
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -1262,8 +1262,8 @@ bool loadVertexArrays()
 {
     bool v = true;
 
-    if (v) v &= loadEmptyVertexArray();
-    if (v) v &= loadInstancedGeometryVertexArray();
+    if(v) v &= loadEmptyVertexArray();
+    if(v) v &= loadInstancedGeometryVertexArray();
 
     return v;
 }
@@ -1283,19 +1283,16 @@ bool loadVertexArrays()
 bool loadBackFramebuffer()
 {
     LOG("Loading {Back-Framebuffer}\n");
-    if (glIsFramebuffer(g_gl.framebuffers[FRAMEBUFFER_BACK]))
+    if(glIsFramebuffer(g_gl.framebuffers[FRAMEBUFFER_BACK]))
         glDeleteFramebuffers(1, &g_gl.framebuffers[FRAMEBUFFER_BACK]);
 
     glGenFramebuffers(1, &g_gl.framebuffers[FRAMEBUFFER_BACK]);
     glBindFramebuffer(GL_FRAMEBUFFER, g_gl.framebuffers[FRAMEBUFFER_BACK]);
-    glFramebufferTexture2D(GL_FRAMEBUFFER,
-        GL_COLOR_ATTACHMENT0,
-        GL_TEXTURE_2D,
-        g_gl.textures[TEXTURE_BACK],
-        0);
+	SetGLObjectLabel(GL_FRAMEBUFFER, g_gl.framebuffers[FRAMEBUFFER_BACK], "FRAMEBUFFER_BACK");
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.textures[TEXTURE_BACK], 0);
 
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    if (GL_FRAMEBUFFER_COMPLETE != glCheckFramebufferStatus(GL_FRAMEBUFFER)) {
+    if(GL_FRAMEBUFFER_COMPLETE != glCheckFramebufferStatus(GL_FRAMEBUFFER)) {
         LOG("=> Failure <=\n");
 
         return false;
@@ -1316,39 +1313,26 @@ bool loadBackFramebuffer()
 bool loadSceneFramebuffer()
 {
     LOG("Loading {Scene-Framebuffer}\n");
-    if (glIsFramebuffer(g_gl.framebuffers[FRAMEBUFFER_SCENE]))
+    if(glIsFramebuffer(g_gl.framebuffers[FRAMEBUFFER_SCENE]))
         glDeleteFramebuffers(1, &g_gl.framebuffers[FRAMEBUFFER_SCENE]);
 
     glGenFramebuffers(1, &g_gl.framebuffers[FRAMEBUFFER_SCENE]);
     glBindFramebuffer(GL_FRAMEBUFFER, g_gl.framebuffers[FRAMEBUFFER_SCENE]);
+	SetGLObjectLabel(GL_FRAMEBUFFER, g_gl.framebuffers[FRAMEBUFFER_SCENE], "FRAMEBUFFER_SCENE");
 
-    if (g_framebuffer.aa >= AA_MSAA2 && g_framebuffer.aa <= AA_MSAA16) {
-        glFramebufferTexture2D(GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D_MULTISAMPLE,
-            g_gl.textures[TEXTURE_SCENE],
-            0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT,
-            GL_TEXTURE_2D_MULTISAMPLE,
-            g_gl.textures[TEXTURE_Z],
-            0);
+    if(g_framebuffer.aa >= AA_MSAA2 && g_framebuffer.aa <= AA_MSAA16)
+	{
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, g_gl.textures[TEXTURE_SCENE], 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D_MULTISAMPLE, g_gl.textures[TEXTURE_Z], 0);
     }
-    else {
-        glFramebufferTexture2D(GL_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D,
-            g_gl.textures[TEXTURE_SCENE],
-            0);
-        glFramebufferTexture2D(GL_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT,
-            GL_TEXTURE_2D,
-            g_gl.textures[TEXTURE_Z],
-            0);
+    else
+	{
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gl.textures[TEXTURE_SCENE], 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, g_gl.textures[TEXTURE_Z], 0);
     }
 
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    if (GL_FRAMEBUFFER_COMPLETE != glCheckFramebufferStatus(GL_FRAMEBUFFER)) {
+    if(GL_FRAMEBUFFER_COMPLETE != glCheckFramebufferStatus(GL_FRAMEBUFFER)) {
         LOG("=> Failure <=\n");
 
         return false;
@@ -1368,8 +1352,8 @@ bool loadFramebuffers()
 {
     bool v = true;
 
-    if (v) v &= loadBackFramebuffer();
-    if (v) v &= loadSceneFramebuffer();
+    if(v) v &= loadBackFramebuffer();
+    if(v) v &= loadSceneFramebuffer();
 
     return v;
 }
@@ -1386,18 +1370,18 @@ void init()
     int i;
 
     for (i = 0; i < CLOCK_COUNT; ++i) {
-        if (g_gl.clocks[i])
+        if(g_gl.clocks[i])
             djgc_release(g_gl.clocks[i]);
         g_gl.clocks[i] = djgc_create();
     }
 
-    if (v) v &= loadTextures();
-    if (v) v &= loadBuffers();
-    if (v) v &= loadFramebuffers();
-    if (v) v &= loadVertexArrays();
-    if (v) v &= loadPrograms();
+    if(v) v &= loadTextures();
+    if(v) v &= loadBuffers();
+    if(v) v &= loadFramebuffers();
+    if(v) v &= loadVertexArrays();
+    if(v) v &= loadPrograms();
 
-    if (!v) throw std::exception();
+    if(!v) throw std::exception();
 }
 
 void release()
@@ -1405,74 +1389,74 @@ void release()
     int i;
 
     for (i = 0; i < CLOCK_COUNT; ++i)
-        if (g_gl.clocks[i])
-            djgc_release(g_gl.clocks[i]);
+        if(g_gl.clocks[i]) djgc_release(g_gl.clocks[i]);
     for (i = 0; i < STREAM_COUNT; ++i)
-        if (g_gl.streams[i])
-            djgb_release(g_gl.streams[i]);
+        if(g_gl.streams[i]) djgb_release(g_gl.streams[i]);
     for (i = 0; i < PROGRAM_COUNT; ++i)
-        if (glIsProgram(g_gl.programs[i]))
-            glDeleteProgram(g_gl.programs[i]);
+        if(glIsProgram(g_gl.programs[i])) glDeleteProgram(g_gl.programs[i]);
     for (i = 0; i < TEXTURE_COUNT; ++i)
-        if (glIsTexture(g_gl.textures[i]))
-            glDeleteTextures(1, &g_gl.textures[i]);
+        if(glIsTexture(g_gl.textures[i])) glDeleteTextures(1, &g_gl.textures[i]);
     for (i = 0; i < BUFFER_COUNT; ++i)
-        if (glIsBuffer(g_gl.buffers[i]))
-            glDeleteBuffers(1, &g_gl.buffers[i]);
+        if(glIsBuffer(g_gl.buffers[i])) glDeleteBuffers(1, &g_gl.buffers[i]);
     for (i = 0; i < FRAMEBUFFER_COUNT; ++i)
-        if (glIsFramebuffer(g_gl.framebuffers[i]))
-            glDeleteFramebuffers(1, &g_gl.framebuffers[i]);
+        if(glIsFramebuffer(g_gl.framebuffers[i])) glDeleteFramebuffers(1, &g_gl.framebuffers[i]);
     for (i = 0; i < VERTEXARRAY_COUNT; ++i)
-        if (glIsVertexArray(g_gl.vertexArrays[i]))
-            glDeleteVertexArrays(1, &g_gl.vertexArrays[i]);
+        if(glIsVertexArray(g_gl.vertexArrays[i])) glDeleteVertexArrays(1, &g_gl.vertexArrays[i]);
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////
 // OpenGL Rendering
-//
 ////////////////////////////////////////////////////////////////////////////////
 
 // -----------------------------------------------------------------------------
 /**
  * Utility functions
  */
-union IndirectCommand {
-    struct {
-        uint32_t num_groups_x,
-            num_groups_y,
-            num_groups_z,
-            align[5];
-    } dispatchIndirect;
-    struct {
-        uint32_t count,
-            primCount,
-            first,
-            baseInstance,
-            align[4];
-    } drawArraysIndirect;
-    struct {
-        uint32_t count,
-            primCount,
-            firstIndex,
-            baseVertex,
-            baseInstance,
-            align[3];
-    } drawElementsIndirect;
-    struct {
-        uint32_t count,
-            first,
-            align[6];
-    } drawMeshTasksIndirectCommandNV;
+union IndirectCommand
+{
+    struct
+	{
+        uint32_t num_groups_x;
+        uint32_t num_groups_Y;
+        uint32_t num_groups_z;
+        uint32_t align[5];
+    }
+	dispatchIndirect;
+    
+	struct
+	{
+        uint32_t count;
+        uint32_t instanceCount;
+        uint32_t first;
+        uint32_t baseInstance;
+        uint32_t align[4];
+    }
+	drawArraysIndirect;
+
+    struct
+	{
+        uint32_t count;
+        uint32_t instanceCount;
+        uint32_t firstIndex;
+        uint32_t baseVertex;
+        uint32_t baseInstance;
+        uint32_t align[3];
+    }
+	drawElementsIndirect;
+
+    struct
+	{
+        uint32_t count;
+        uint32_t first;
+        uint32_t align[6];
+    }
+	drawMeshTasksIndirectCommandNV;
 };
 
-bool
-createIndirectCommandBuffer(
-    GLuint binding,
-    int bufferid,
-    IndirectCommand drawArrays
-) {
-    if (!glIsBuffer(g_gl.buffers[bufferid]))
+bool createIndirectCommandBuffer(GLuint binding, int bufferid, IndirectCommand drawArrays)
+{
+    if(!glIsBuffer(g_gl.buffers[bufferid]))
         glGenBuffers(1, &g_gl.buffers[bufferid]);
 
     glBindBuffer(binding, g_gl.buffers[bufferid]);
@@ -1484,14 +1468,12 @@ createIndirectCommandBuffer(
 
 bool createAtomicCounters(GLint atomicData[8])
 {
-    if (!glIsBuffer(g_gl.buffers[BUFFER_ATOMIC_COUNTER]))
+    if(!glIsBuffer(g_gl.buffers[BUFFER_ATOMIC_COUNTER]))
         glGenBuffers(1, &g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
 
     glBindBuffer(GL_ATOMIC_COUNTER_BUFFER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
-    glBufferData(GL_ATOMIC_COUNTER_BUFFER,
-                 sizeof(GLint) * 8,
-                 atomicData,
-                 GL_STREAM_DRAW);
+    glBufferData(GL_ATOMIC_COUNTER_BUFFER, sizeof(GLint) * 8, atomicData, GL_STREAM_DRAW);
+	SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_ATOMIC_COUNTER], "BUFFER_ATOMIC_COUNTER");
 
     return (glGetError() == GL_NO_ERROR);
 }
@@ -1510,21 +1492,11 @@ void callUpdateIndirectProgram(
     GLintptr counterOffset2,
     GLuint indirectBuffer
 ) {
-    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER,
-                      BINDING_ATOMIC_COUNTER,
-                      counter1,
-                      counterOffset1,
-                      sizeof(int));
-    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER,
-                      BINDING_ATOMIC_COUNTER2,
-                      counter2,
-                      counterOffset2,
-                      sizeof(int));
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_DISPATCH_INDIRECT,
-                     indirectBuffer);
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER,  counter1, counterOffset1, sizeof(int));
+    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, BINDING_VISIBLE_SUBD_ATOMIC_COUNTER, counter2, counterOffset2, sizeof(int));
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_DISPATCH_INDIRECT, indirectBuffer);
     glUseProgram(g_gl.programs[programName]);
-    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+	glMemoryBarrier(GL_ALL_BARRIER_BITS);
     glDispatchCompute(1, 1, 1);
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
 }
@@ -1545,7 +1517,7 @@ void renderSceneTs() {
 
     // render terrain
     glPatchParameteri(GL_PATCH_VERTICES, 1);
-    if (g_terrain.flags.reset) {
+    if(g_terrain.flags.reset) {
         IndirectCommand drawArrays = { 2u, 1u, 0u, 0u, 0u, 0u, 0u, 0u };
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -1562,7 +1534,7 @@ void renderSceneTs() {
 
     // render the terrain
     glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_ATOMIC_COUNTER,
+                     BINDING_SUBD_ATOMIC_COUNTER,
                      g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
                      BUFFER_SUBD1,
@@ -1601,7 +1573,7 @@ void renderSceneGs() {
     int nextOffset = 0;
 
     // render terrain
-    if (g_terrain.flags.reset) {
+    if(g_terrain.flags.reset) {
         IndirectCommand drawArrays = { 2u, 1u, 0u, 0u, 0u, 0u, 0u, 0u };
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -1618,7 +1590,7 @@ void renderSceneGs() {
 
     // render terrain
     glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_ATOMIC_COUNTER,
+                     BINDING_SUBD_ATOMIC_COUNTER,
                      g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
                      BUFFER_SUBD1,
@@ -1657,7 +1629,7 @@ void renderSceneMs() {
     int nextOffset = 0;
 
     // Init
-    if (g_terrain.flags.reset) {
+    if(g_terrain.flags.reset) {
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         IndirectCommand cmd = {
             2u / (1u << g_terrain.computeThreadCount) + 1u,
@@ -1690,7 +1662,7 @@ void renderSceneMs() {
                      BUFFER_SUBD2,
                      g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
     glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_ATOMIC_COUNTER,
+                     BINDING_SUBD_ATOMIC_COUNTER,
                      g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
                      BUFFER_DISPATCH_INDIRECT,
@@ -1718,81 +1690,84 @@ void renderSceneMs() {
  *
  * This is the orginal implementation of the GPU Zen 2 chapter.
  * The compute shader pipeline updates the subd buffer a dedicated
- * compute shader stage. Then a tessellated patch with fixed tessellation
- * factors is instanced for each key that leads to a visible
- * triangle in a seperate rendering program.
+ * compute shader stage. Then a TESSELLATED PATCH WITH FIXED TESSELLATION FACTORS
+ * is instanced for each key that leads to a visible triangle in a seperate rendering program.
  */
-void renderSceneCs() {
+void renderSceneCs()
+{
     static int offset = 0;
     int nextOffset = 0;
 
     // update the subd buffers
-    if (g_terrain.flags.reset) {
+    if(g_terrain.flags.reset)
+	{
         GLint atomicData[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         IndirectCommand cmd = {
-            2u / (1u << g_terrain.computeThreadCount) + 1u,
-            1u, 1u, 0u, 0u, 0u, 0u, 2u
+            2u / (1u << g_terrain.computeThreadCount) + 1u, // num_groups_x (note: initially only 2 triangles)
+            1u, // num_groups_y
+			1u, // num_groups_z
+			0u, // unused
+			0u, // unused
+			0u, // unused
+			0u, // unused
+			2u // Note: Store current size of the subdivision buffer in data[7] (note: initially only 2 triangles)
         };
-        const int subdLevel = 2 * g_terrain.gpuSubd - 1;
-        const uint32_t cnt = subdLevel > 0 ? 6u << subdLevel : 3u;
-        IndirectCommand drawElements = { cnt, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+
+		// g_terrain.baseSubdivisionLevel = 0 -> subdLevel = -1 --> cnt = 3   (1 triangle)
+		// g_terrain.baseSubdivisionLevel = 1 -> subdLevel =  1 --> cnt = 12  (4 subtriangles)
+		// g_terrain.baseSubdivisionLevel = 2 -> subdLevel =  3 --> cnt = 48  (16 subtriangles)
+		// g_terrain.baseSubdivisionLevel = 3 -> subdLevel =  5 --> cnt = 192 (64 subtriangles)
+		// TODO: it seems that subdLevel is not really correct...
+		// -> subdLevel 1 should produce 2 subtriangles
+		// -> subdLevel 2 should produce 4 subtriangles
+		// -> subdLevel 3 should produce 8 subtriangles
+        const int subdLevel = 2 * g_terrain.baseSubdivisionLevel - 1;
+        const uint32_t vertexCount = subdLevel > 0 ? (6u << subdLevel) : 3u;
+        IndirectCommand drawElements = {
+			vertexCount,	// count
+			0u,				// instanceCount
+			0u,				// firstIndex
+			0u,				// baseVertex
+			0u,				// baseInstance
+			0u,				// unused
+			0u,				// unused
+			0u				// unused
+		};
 
         loadSubdivisionBuffers();
         createAtomicCounters(atomicData);
-        createIndirectCommandBuffer(GL_DISPATCH_INDIRECT_BUFFER,
-                                    BUFFER_DISPATCH_INDIRECT,
-                                    cmd);
-        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER,
-                                    BUFFER_DRAW_INDIRECT,
-                                    drawElements);
+        createIndirectCommandBuffer(GL_DISPATCH_INDIRECT_BUFFER, BUFFER_DISPATCH_INDIRECT, cmd);
+        createIndirectCommandBuffer(GL_DRAW_INDIRECT_BUFFER, BUFFER_DRAW_INDIRECT, drawElements);
+		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_DISPATCH_INDIRECT], "BUFFER_DISPATCH_INDIRECT");
+		SetGLObjectLabel(GL_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT], "BUFFER_DRAW_INDIRECT");
 
         g_terrain.pingPong = 1;
         offset = 0;
         g_terrain.flags.reset = false;
     }
 
+	// Bind all buffers used by the update and draw passes
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD1, g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);	// Subdivision buffer - ping
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_SUBD2, g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);		// Subdivision buffer - pong
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_CULLED_SUBD1, g_gl.buffers[BUFFER_CULLED_SUBD1]);				// Subdivision buffer of visible triangles
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, BUFFER_DISPATCH_INDIRECT, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);	// Dispatch indirect params buffer
+    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER, BINDING_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_ATOMIC_COUNTER]);		// Subdivision buffer atomic counter
+	glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER, BINDING_VISIBLE_SUBD_ATOMIC_COUNTER, g_gl.buffers[BUFFER_DRAW_INDIRECT], /*offset*/ sizeof(int), /*size*/ sizeof(int)); // // Subdivision buffer of visible triangles atomic counter
 
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD1,
-                     g_gl.buffers[BUFFER_SUBD1 + 1 - g_terrain.pingPong]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_SUBD2,
-                     g_gl.buffers[BUFFER_SUBD1 + g_terrain.pingPong]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_CULLED_SUBD1,
-                     g_gl.buffers[BUFFER_CULLED_SUBD1]);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,
-                     BUFFER_DISPATCH_INDIRECT,
-                     g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
-    glBindBufferBase(GL_ATOMIC_COUNTER_BUFFER,
-                     BINDING_ATOMIC_COUNTER,
-                     g_gl.buffers[BUFFER_ATOMIC_COUNTER]);
-    glBindBufferRange(GL_ATOMIC_COUNTER_BUFFER,
-                      BINDING_ATOMIC_COUNTER2,
-                      g_gl.buffers[BUFFER_DRAW_INDIRECT],
-                      sizeof(int), sizeof(int));
-
-    // update the subd buffer
-    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER,
-                 g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
+    // Compute the triangles LODs and update the subdivision buffer (LodKernel)
+    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DISPATCH_INDIRECT]); // Dispatch indirect params buffer
     glUseProgram(g_gl.programs[PROGRAM_SUBD_CS_LOD]);
     glDispatchComputeIndirect(0);
 
-    // render the terrain
+    // Render the terrain (RenderKernel)
     glMemoryBarrier(GL_ALL_BARRIER_BITS);
     glUseProgram(g_gl.programs[PROGRAM_TERRAIN]);
-    glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]);
-    glBindBuffer(GL_DRAW_INDIRECT_BUFFER,
-                 g_gl.buffers[BUFFER_DRAW_INDIRECT]);
-    glDrawElementsIndirect(GL_TRIANGLES,
-                           GL_UNSIGNED_SHORT,
-                           NULL);
+    glBindVertexArray(g_gl.vertexArrays[VERTEXARRAY_INSTANCED_GRID]); // The VAO references the patch vertex and index buffers (which data depends on the basic patch subdivision level)
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, g_gl.buffers[BUFFER_DRAW_INDIRECT]);
+    glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_SHORT, NULL);
 
-    // update batch
-    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT,
-                              g_gl.buffers[BUFFER_ATOMIC_COUNTER], 0,
-                              g_gl.buffers[BUFFER_DRAW_INDIRECT], sizeof(int),
-                              g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
+    // Update batch (IndirectBatcherKernel)
+    callUpdateIndirectProgram(PROGRAM_UPDATE_INDIRECT, g_gl.buffers[BUFFER_ATOMIC_COUNTER], 0, g_gl.buffers[BUFFER_DRAW_INDIRECT], sizeof(int), g_gl.buffers[BUFFER_DISPATCH_INDIRECT]);
 
     g_terrain.pingPong = 1 - g_terrain.pingPong;
     offset = nextOffset;
@@ -1811,7 +1786,7 @@ void renderScene()
     glViewport(0, 0, g_framebuffer.w, g_framebuffer.h);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
-    if (g_terrain.flags.wire)
+    if(g_terrain.flags.wire)
         glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 
     // clear framebuffer
@@ -1839,11 +1814,12 @@ void renderScene()
     }
 
     // reset GL state
-    if (g_terrain.flags.wire)
+    if(g_terrain.flags.wire)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     glDisable(GL_DEPTH_TEST);
 
-    if (g_terrain.flags.freeze_step) {
+    if(g_terrain.flags.freeze_step)
+	{
         g_terrain.flags.freeze = true;
         loadPrograms();
         g_terrain.flags.freeze_step = false;
@@ -1861,7 +1837,7 @@ void renderScene()
  */
 void imguiSetAa()
 {
-    if (!loadSceneFramebufferTexture() || !loadSceneFramebuffer()
+    if(!loadSceneFramebufferTexture() || !loadSceneFramebuffer()
         || !loadViewerProgram()) {
         LOG("=> Framebuffer config failed <=\n");
         throw std::exception();
@@ -1882,7 +1858,7 @@ void renderGui(double cpuDt, double gpuDt)
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     // draw HUD
-    if (g_app.viewer.hud) {
+    if(g_app.viewer.hud) {
         // ImGui
         glUseProgram(0);
         ImGui_ImplGlfwGL3_NewFrame();
@@ -1898,11 +1874,11 @@ void renderGui(double cpuDt, double gpuDt)
                 "MSAA x8",
                 "MSAA x16"
             };
-            if (ImGui::Combo("AA", &g_framebuffer.aa, aaItems, BUFFER_SIZE(aaItems)))
+            if(ImGui::Combo("AA", &g_framebuffer.aa, aaItems, BUFFER_SIZE(aaItems)))
                 imguiSetAa();
-            if (ImGui::Combo("MSAA", &g_framebuffer.msaa.fixed, "Fixed\0Random\0\0"))
+            if(ImGui::Combo("MSAA", &g_framebuffer.msaa.fixed, "Fixed\0Random\0\0"))
                 imguiSetAa();
-            if (ImGui::Button("Screenshot")) {
+            if(ImGui::Button("Screenshot")) {
                 static int cnt = 0;
                 char buf[1024];
 
@@ -1912,9 +1888,9 @@ void renderGui(double cpuDt, double gpuDt)
                 ++cnt;
             }
             ImGui::SameLine();
-            if (ImGui::Button("Record"))
+            if(ImGui::Button("Record"))
                 g_app.recorder.on = !g_app.recorder.on;
-            if (g_app.recorder.on) {
+            if(g_app.recorder.on) {
                 ImGui::SameLine();
                 ImGui::Text("Recording...");
             }
@@ -1926,9 +1902,9 @@ void renderGui(double cpuDt, double gpuDt)
         ImGui::SetNextWindowSize(ImVec2(250, 120)/*, ImGuiSetCond_FirstUseEver*/);
         ImGui::Begin("Viewer");
         {
-            if (ImGui::SliderFloat("Exposure", &g_app.viewer.exposure, -3.0f, 3.0f))
+            if(ImGui::SliderFloat("Exposure", &g_app.viewer.exposure, -3.0f, 3.0f))
                 configureViewerProgram();
-            if (ImGui::SliderFloat("Gamma", &g_app.viewer.gamma, 1.0f, 4.0f))
+            if(ImGui::SliderFloat("Gamma", &g_app.viewer.gamma, 1.0f, 4.0f))
                 configureViewerProgram();
         }
         ImGui::End();
@@ -1938,24 +1914,31 @@ void renderGui(double cpuDt, double gpuDt)
         ImGui::SetNextWindowSize(ImVec2(250, 120)/*, ImGuiSetCond_FirstUseEver*/);
         ImGui::Begin("Camera");
         {
-            if (ImGui::SliderFloat("FOVY", &g_camera.fovy, 1.0f, 179.0f)) {
+            if(ImGui::SliderFloat("FOVY", &g_camera.fovy, 1.0f, 179.0f)) {
                 configureTerrainProgram();
             }
-            if (ImGui::SliderFloat("zNear", &g_camera.zNear, 0.0001f, 1.f)) {
-                if (g_camera.zNear >= g_camera.zFar)
+            if(ImGui::SliderFloat("zNear", &g_camera.zNear, 0.0001f, 1.f)) {
+                if(g_camera.zNear >= g_camera.zFar)
                     g_camera.zNear = g_camera.zFar - 0.01f;
             }
-            if (ImGui::SliderFloat("zFar", &g_camera.zFar, 1.f, 32.f)) {
-                if (g_camera.zFar <= g_camera.zNear)
+            if(ImGui::SliderFloat("zFar", &g_camera.zFar, 1.f, 32.f)) {
+                if(g_camera.zFar <= g_camera.zNear)
                     g_camera.zFar = g_camera.zNear + 0.01f;
             }
         }
         ImGui::End();
         // Terrain Widgets
         ImGui::SetNextWindowPos(ImVec2(10, 140)/*, ImGuiSetCond_FirstUseEver*/);
-        ImGui::SetNextWindowSize(ImVec2(510, 210)/*, ImGuiSetCond_FirstUseEver*/);
+        ImGui::SetNextWindowSize(ImVec2(510, 300)/*, ImGuiSetCond_FirstUseEver*/);
         ImGui::Begin("Terrain");
         {
+			ImGui::SliderFloat("Position X", &g_terrain.pos.x, -20.f, +20.f);
+			ImGui::SliderFloat("Position Y", &g_terrain.pos.y, -20.f, +20.f);
+			ImGui::SliderFloat("Position Z", &g_terrain.pos.z, -20.f, +20.f);
+			ImGui::SliderFloat("Rotation X", &g_terrain.rotAnglesInDegrees.x, -180.f, +180.f);
+			ImGui::SliderFloat("Rotation Y", &g_terrain.rotAnglesInDegrees.y, -180.f, +180.f);
+			ImGui::SliderFloat("Rotation Z", &g_terrain.rotAnglesInDegrees.z, -180.f, +180.f);
+
             const char* eShadings[] = {
                 "Diffuse",
                 "Normals",
@@ -1966,7 +1949,7 @@ void renderGui(double cpuDt, double gpuDt)
                 "Geometry Shader",
                 "Compute Shader"
             };
-            if (GLAD_GL_NV_mesh_shader)
+            if(GLAD_GL_NV_mesh_shader)
                 eMethods.push_back("Mesh Shader");
             ImGui::Text("CPU_dt: %.3f %s",
                 cpuDt < 1. ? cpuDt * 1e3 : cpuDt,
@@ -1975,12 +1958,12 @@ void renderGui(double cpuDt, double gpuDt)
             ImGui::Text("GPU_dt: %.3f %s",
                 gpuDt < 1. ? gpuDt * 1e3 : gpuDt,
                 gpuDt < 1. ? "ms" : " s");
-            if (ImGui::Combo("Shading", &g_terrain.shading, &eShadings[0], BUFFER_SIZE(eShadings))) {
+            if(ImGui::Combo("Shading", &g_terrain.shading, &eShadings[0], BUFFER_SIZE(eShadings))) {
                 loadTerrainProgram();
                 g_terrain.flags.reset = true;
             }
-            if (ImGui::Combo("Method", &g_terrain.method, &eMethods[0], eMethods.size())) {
-                if (g_terrain.method == METHOD_MS && g_terrain.computeThreadCount>5) {
+            if(ImGui::Combo("Method", &g_terrain.method, &eMethods[0], eMethods.size())) {
+                if(g_terrain.method == METHOD_MS && g_terrain.computeThreadCount>5) {
                     g_terrain.computeThreadCount = 5;
                 }
 
@@ -1989,22 +1972,22 @@ void renderGui(double cpuDt, double gpuDt)
             }
             ImGui::Text("flags: ");
             ImGui::SameLine();
-            if (ImGui::Checkbox("cull", &g_terrain.flags.cull))
+            if(ImGui::Checkbox("cull", &g_terrain.flags.cull))
                 loadPrograms();
             ImGui::SameLine();
             ImGui::Checkbox("wire", &g_terrain.flags.wire);
             ImGui::SameLine();
-            if (ImGui::Checkbox("freeze", &g_terrain.flags.freeze)) {
+            if(ImGui::Checkbox("freeze", &g_terrain.flags.freeze)) {
                 loadTerrainProgram();
-                if (g_terrain.method == METHOD_CS)
+                if(g_terrain.method == METHOD_CS)
                     configureSubdCsLodProgram();
             }
-            if (!g_terrain.dmap.pathToFile.empty()) {
+            if(!g_terrain.dmap.pathToFile.empty()) {
                 ImGui::SameLine();
-                if (ImGui::Checkbox("displace", &g_terrain.flags.displace))
+                if(ImGui::Checkbox("displace", &g_terrain.flags.displace))
                     loadTerrainProgram();
             }
-            if (ImGui::SliderInt("PatchSubdLevel", &g_terrain.gpuSubd, 0, 3)) {
+            if(ImGui::SliderInt("baseSubdivisionLevel", &g_terrain.baseSubdivisionLevel, 0, 3)) {
                 loadInstancedGeometryBuffers();
                 loadInstancedGeometryVertexArray();
                 loadPrograms();
@@ -2013,26 +1996,26 @@ void renderGui(double cpuDt, double gpuDt)
                 LOG("Patch Vertex Count: %d\nPatch Primitive Count: %d\n", instancedMeshVertexCount, instancedMeshPrimitiveCount);
 
             }
-            if (ImGui::SliderFloat("PixelsPerEdge", &g_terrain.primitivePixelLengthTarget, 1, 16)) {
+            if(ImGui::SliderFloat("PixelsPerEdge", &g_terrain.primitivePixelLengthTarget, 1, 128)) {
                 configureTerrainProgram();
-                if (g_terrain.method == METHOD_CS)
+                if(g_terrain.method == METHOD_CS)
                     configureSubdCsLodProgram();
             }
-            if (ImGui::SliderFloat("DmapScale", &g_terrain.dmap.scale, 0.f, 1.f)) {
+            if(ImGui::SliderFloat("DmapScale", &g_terrain.dmap.scale, 0.f, 1.f)) {
                 configureTerrainProgram();
-                if (g_terrain.method == METHOD_CS)
+                if(g_terrain.method == METHOD_CS)
                     configureSubdCsLodProgram();
             }
-            if (g_terrain.method == METHOD_CS || g_terrain.method == METHOD_MS) {
+            if(g_terrain.method == METHOD_CS || g_terrain.method == METHOD_MS) {
                 char buf[64];
 
                 int maxValue = 8;
-                if (g_terrain.method == METHOD_MS) {
+                if(g_terrain.method == METHOD_MS) {
                     maxValue = 5;
                 }
 
                 sprintf(buf, "ComputeThreadCount (%02i)", 1 << g_terrain.computeThreadCount);
-                if (ImGui::SliderInt(buf, &g_terrain.computeThreadCount, 0, maxValue)) {
+                if(ImGui::SliderInt(buf, &g_terrain.computeThreadCount, 0, maxValue)) {
                     loadPrograms();
                     g_terrain.flags.reset = true;
                 }
@@ -2045,7 +2028,7 @@ void renderGui(double cpuDt, double gpuDt)
     }
 
     // screen recording
-    if (g_app.recorder.on) {
+    if(g_app.recorder.on) {
         char name[64], path[1024];
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gl.framebuffers[FRAMEBUFFER_BACK]);
@@ -2109,10 +2092,10 @@ keyboardCallback(
     int key, int, int action, int
 ) {
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureKeyboard)
+    if(io.WantCaptureKeyboard)
         return;
 
-    if (action == GLFW_PRESS) {
+    if(action == GLFW_PRESS) {
         switch (key) {
         case GLFW_KEY_ESCAPE:
             //glfwSetWindowShouldClose(window, GL_TRUE);
@@ -2142,7 +2125,7 @@ keyboardCallback(
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
 {
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureMouse)
+    if(io.WantCaptureMouse)
         return;
 }
 
@@ -2153,10 +2136,10 @@ void mouseMotionCallback(GLFWwindow* window, double x, double y)
         dy = y - y0;
 
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureMouse)
+    if(io.WantCaptureMouse)
         return;
 
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+    if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
         dja::mat3 axis = dja::transpose(g_camera.axis);
         g_camera.axis = dja::mat3::rotation(dja::vec3(0, 0, 1), dx * 5e-3)
             * g_camera.axis;
@@ -2166,7 +2149,7 @@ void mouseMotionCallback(GLFWwindow* window, double x, double y)
         g_camera.axis[1] = dja::normalize(g_camera.axis[1]);
         g_camera.axis[2] = dja::normalize(g_camera.axis[2]);
     }
-    else if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+    else if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
         dja::mat3 axis = dja::transpose(g_camera.axis);
         g_camera.pos -= axis[1] * dx * 5e-3 * norm(g_camera.pos);
         g_camera.pos += axis[2] * dy * 5e-3 * norm(g_camera.pos);
@@ -2180,7 +2163,7 @@ void mouseScrollCallback(GLFWwindow* window, double xoffset, double yoffset)
 {
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplGlfw_ScrollCallback(window, xoffset, yoffset);
-    if (io.WantCaptureMouse)
+    if(io.WantCaptureMouse)
         return;
 
     dja::mat3 axis = dja::transpose(g_camera.axis);
@@ -2208,7 +2191,7 @@ int main(int argc, char **argv)
         VIEWER_DEFAULT_WIDTH, VIEWER_DEFAULT_HEIGHT,
         "Implicit GPU Subdivision Demo", NULL, NULL
     );
-    if (window == NULL) {
+    if(window == NULL) {
         LOG("=> Failure <=\n");
         glfwTerminate();
         return -1;
@@ -2221,7 +2204,7 @@ int main(int argc, char **argv)
 
     // Load OpenGL functions
     LOG("Loading {OpenGL}\n");
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+    if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         LOG("gladLoadGLLoader failed\n");
         return -1;
     }
@@ -2240,12 +2223,10 @@ int main(int argc, char **argv)
         LOG("-- Begin -- Init\n");
         init();
         LOG("-- End -- Init\n");
-
+		
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
-
             render();
-
             glfwSwapBuffers(window);
         }
 
@@ -2278,7 +2259,7 @@ int main(int argc, char **argv)
 
 ////Instanced patch geometry at various subdiv levels////
 
-//gpuSubd == 0
+//baseSubdivisionLevel == 0
 const dja::vec2 verticesL0[] = {
     { 0.0f, 0.0f },
     { 1.0f, 0.0f },
@@ -2286,7 +2267,7 @@ const dja::vec2 verticesL0[] = {
 };
 const uint16_t indexesL0[] = { 0u, 1u, 2u };
 
-//gpuSubd == 1
+//baseSubdivisionLevel == 1
 const dja::vec2 verticesL1[] = {
     { 0.0f, 1.0f },
     { 0.5f, 0.5f },
@@ -2302,7 +2283,7 @@ const uint16_t indexesL1[] = {
     1u, 4u, 5u
 };
 
-//gpuSubd == 2
+//baseSubdivisionLevel == 2
 const dja::vec2 verticesL2[] = {
     { 0.25f, 0.75f },
     { 0.0f, 1.0f },
@@ -2343,7 +2324,7 @@ const uint16_t indexesL2[] = {
     12u, 13u, 14u
 };
 
-//gpuSubd == 3
+//baseSubdivisionLevel == 3
 const dja::vec2 verticesL3[] = {
     { 0.25f*0.5f, 0.75f*0.5f + 0.5f },
     { 0.0f*0.5f, 1.0f*0.5f + 0.5f },
