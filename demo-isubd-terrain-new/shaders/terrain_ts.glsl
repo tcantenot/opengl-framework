@@ -52,6 +52,15 @@ void main()
     // get coarse triangle associated to the key
     uint primID = u_SubdBufferIn[threadID].x;
 
+	// Note: even if we check the limit of the subdivision buffer, some triangles can be missing
+	// if at the beginning of the current iteration we are close to the limit.
+	// Indeed the current iteration will potentially produce more triangles and reach the subdivision
+	// buffer limit causing previously valid triangles to be thrown out of the buffer.
+	// To mitigate the issue, we stop subdivided when we reached some fraction of the max capacity.
+	// (it is possible to be prefectly safe if we stop subdividing when we go above 50% occupancy).
+	const float kMaxSubdBufferOccupancyBeforeStopping = 0.500001;
+	const bool bReachedSubdBufferLimit = false;//(prevIterationsSubdivisions >= (MAX_NUM_SUBDIVISIONS * kMaxSubdBufferOccupancyBeforeStopping));
+
 	#if 0
     vec3 v_in[3] = vec3[3](
         u_VertexBuffer[u_IndexBuffer[primID * 3    ]].xyz,
@@ -76,7 +85,7 @@ void main()
 #if FLAG_FREEZE
     targetLod = parentLod = findMSB(key);
 #endif
-    updateSubdBuffer(primID, key, targetLod, parentLod);
+    updateSubdBuffer(primID, key, targetLod, parentLod, bReachedSubdBufferLimit);
 
 #if FLAG_CULL
     // Cull invisible nodes

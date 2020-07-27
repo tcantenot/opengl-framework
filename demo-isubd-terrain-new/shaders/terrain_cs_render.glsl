@@ -89,6 +89,10 @@ layout(location = 0) out vec4 o_FragColor;
 void main()
 {
     o_FragColor = shadeFragment(i_TexCoord);
+
+	uint numSubdivisions = atomicCounter(u_SubdBufferCounter);
+	if(numSubdivisions >= uint(MAX_NUM_SUBDIVISIONS))
+		o_FragColor = vec4(1.0, 0.0, 0.0, 1.0);
 }
 #endif
 

@@ -36,12 +36,16 @@ void main()
 {
 	#if UPDATE_INDIRECT_STRUCT
 	// uint cnt = atomicCounter(u_SubdAtomicCounter) / 32 + 1;
-    uint cnt = atomicCounter(u_SubdAtomicCounter) / UPDATE_INDIRECT_VALUE_DIVIDE + UPDATE_INDIRECT_VALUE_ADD;
+
+	uint numSubdivisions = atomicCounter(u_SubdAtomicCounter);
+	uint numSubdivisionsClamped = min(numSubdivisions, MAX_NUM_SUBDIVISIONS);
+
+    uint cnt = numSubdivisionsClamped / UPDATE_INDIRECT_VALUE_DIVIDE + UPDATE_INDIRECT_VALUE_ADD;
 
     u_IndirectCommand[UPDATE_INDIRECT_OFFSET] = cnt;
 
     //Hack: Store counter value in the last reserved field of the draw/dispatch indirect structure
-    u_IndirectCommand[7] = atomicCounter(u_SubdAtomicCounter);
+    u_IndirectCommand[7] = numSubdivisionsClamped;
 	#endif
 
     //Reset atomic counters

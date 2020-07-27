@@ -547,6 +547,7 @@ void setShaderMacros(djg_program *djp)
     djgp_push_string(djp, "#define INSTANCED_MESH_VERTEX_COUNT %i\n", instancedMeshVertexCount);
     djgp_push_string(djp, "#define INSTANCED_MESH_PRIMITIVE_COUNT %i\n", instancedMeshPrimitiveCount);
     djgp_push_string(djp, "#define COMPUTE_THREAD_COUNT %i\n", 1u << g_terrain.computeThreadCount); //Compute Shader + Mesh Shader + Batch Program
+    djgp_push_string(djp, "#define MAX_NUM_SUBDIVISIONS %i\n", kMaxNumSubdivisions);
 
     // bindings
     djgp_push_string(djp, "#define BUFFER_BINDING_TRANSFORMS %i\n", STREAM_TRANSFORM);
@@ -708,6 +709,8 @@ loadUpdateIndirectProgram(
     djgp_push_string(djp, "#define UPDATE_INDIRECT_OFFSET %i\n", updateOffset);
     djgp_push_string(djp, "#define UPDATE_INDIRECT_VALUE_DIVIDE %i\n", divideValue);
     djgp_push_string(djp, "#define UPDATE_INDIRECT_VALUE_ADD %i\n", addValue);
+
+    djgp_push_string(djp, "#define MAX_NUM_SUBDIVISIONS %i\n", kMaxNumSubdivisions);
 
     djgp_push_file(djp, strcat2(buf, g_app.dir.shader, "terrain_updateIndirect_cs.glsl"));
 

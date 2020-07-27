@@ -105,7 +105,8 @@ void writeKey(uint primID, uint key)
 {
     uint idx = atomicCounterIncrement(u_SubdBufferCounter);
 
-    u_SubdBufferOut[idx] = uvec2(primID, key);
+	if(idx < MAX_NUM_SUBDIVISIONS)
+		u_SubdBufferOut[idx] = uvec2(primID, key);
 }
 
 // 1.2.3 Iterative Construction
@@ -125,6 +126,7 @@ void updateSubdBuffer(
     uint key,
     int targetLod,
     int parentLod,
+	bool bReachedSubdBufferLimit,
     bool isVisible
 ) {
     // Extract subdivision level associated to the key
@@ -136,11 +138,19 @@ void updateSubdBuffer(
 	// --> output the two subtriangles keys for further processing (LOD computation + possible further subdivision)
     if (/* subdivide ? */ keyLod < targetLod && !isLeafKey(key) && isVisible)
 	{
-        uint children[2]; childrenKeys(key, children);
+		if(bReachedSubdBufferLimit)
+		{
+			// If we reached the subdivision buffer limit, do not subdivide further
+			writeKey(primID, key);
+		}
+		else
+		{
+			uint children[2]; childrenKeys(key, children);
 
-		// TODO: optimize -> increment atomic counter by 2 at once
-        writeKey(primID, children[0]);
-        writeKey(primID, children[1]);
+			// TODO: optimize -> increment atomic counter by 2 at once
+			writeKey(primID, children[0]);
+			writeKey(primID, children[1]);
+		}
     }
 	// Keep triangle as it is sufficiently small
     else if (/* keep ? */ keyLod < (parentLod + 1) && isVisible)
@@ -176,9 +186,9 @@ void updateSubdBuffer(
     }
 }
 
-void updateSubdBuffer(uint primID, uint key, int targetLod, int parentLod)
+void updateSubdBuffer(uint primID, uint key, int targetLod, int parentLod, bool bReachedSubdBufferLimit)
 {
-    updateSubdBuffer(primID, key, targetLod, parentLod, true);
+    updateSubdBuffer(primID, key, targetLod, parentLod, bReachedSubdBufferLimit, true);
 }
 
 vec4 shadeFragment(vec2 texCoord)
